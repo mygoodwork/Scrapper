@@ -9,7 +9,6 @@ import os
 import time
 import threading
 import signal
-import math
 import random
 import urllib3
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -21,14 +20,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # -------------------------
 # Environment configuration
 # -------------------------
-I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "true").strip().lower() == "true"
+I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "false").strip().lower() == "true"
 
 # Target endpoint (full URL)
 ENDPOINT_URL = os.environ.get("ENDPOINT_URL", "https://example.com/api/test").strip()
 
 # Order / UID values used as cookies/params
 ORDER_NO = os.environ.get("ORDER_NO", "22811436844419928064")
-BNC = os.environ.get("BNC", "")  # <-- changed: read BNC env var
+BNC = os.environ.get("BNC", "")  # cookie value read from env
 
 # HTTP method: GET or POST
 METHOD = os.environ.get("METHOD", "GET").strip().upper()
@@ -166,6 +165,45 @@ def handle_rate_limit(response):
         wait = None
     return wait
 
+# Detailed error logger
+def log_error_details(worker_id: int, i: int, r=None, params=None, exc=None):
+    """
+    Log detailed info about 404s or request exceptions.
+    - r: requests.Response object (may be None)
+    - params: dict of query/body params
+    - exc: exception object
+    """
+    print("=" * 80, flush=True)
+    print(f"[DEBUG][worker-{worker_id}] Request #{i+1} detailed log:", flush=True)
+    if exc:
+        print(f"  Exception: {type(exc).__name__}: {exc}", flush=True)
+    if r is not None:
+        try:
+            print(f"  Status: {r.status_code}", flush=True)
+            # print response headers (some helpful ones)
+            try:
+                print(f"  Response headers: {dict(r.headers)}", flush=True)
+            except Exception:
+                pass
+            # print limited response body
+            try:
+                content = r.text
+                if len(content) > 2000:
+                    content = content[:2000] + " ...[truncated]"
+                print(f"  Response body (up to 2000 chars):\n{content}", flush=True)
+            except Exception as e:
+                print(f"  Failed to read response body: {e}", flush=True)
+        except Exception as e:
+            print(f"  Error while inspecting response object: {e}", flush=True)
+    if params is not None:
+        print(f"  Params/Body: {params}", flush=True)
+    cookies = build_cookies()
+    if cookies:
+        print(f"  Cookies: {cookies}", flush=True)
+    headers = build_headers(worker_id)
+    print(f"  Headers: {headers}", flush=True)
+    print("=" * 80, flush=True)
+
 # -------------------------
 # Worker logic
 # -------------------------
@@ -182,13 +220,29 @@ def send_requests_once(session: requests.Session, worker_id: int):
             print(f"[INFO][worker-{worker_id}] Stop requested; aborting batch.", flush=True)
             return
 
+        params = None
+        r = None
         try:
             params = build_params()
             # Choose GET or POST
             if METHOD == "POST":
-                r = session.post(ENDPOINT_URL, headers=headers, cookies=cookies, json=params, timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
+                r = session.post(
+                    ENDPOINT_URL,
+                    headers=headers,
+                    cookies=cookies,
+                    json=params,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=VERIFY_SSL,
+                )
             else:
-                r = session.get(ENDPOINT_URL, headers=headers, cookies=cookies, params=params, timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
+                r = session.get(
+                    ENDPOINT_URL,
+                    headers=headers,
+                    cookies=cookies,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=VERIFY_SSL,
+                )
 
             inc_counter("sent")
             with counters_lock:
@@ -198,6 +252,11 @@ def send_requests_once(session: requests.Session, worker_id: int):
 
             if i < max_print:
                 print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] → {r.status_code}", flush=True)
+
+            # detailed logging for 4xx/5xx (including 404)
+            if r.status_code >= 400:
+                inc_counter("errors")
+                log_error_details(worker_id, i, r=r, params=params)
 
             if r.status_code == 429:
                 wait = handle_rate_limit(r)
@@ -215,12 +274,15 @@ def send_requests_once(session: requests.Session, worker_id: int):
 
         except requests.RequestException as e:
             inc_counter("errors")
+            # log exception details and the params used for this request
+            log_error_details(worker_id, i, r=r, params=params, exc=e)
             if i < max_print:
-                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] Request error: {type(e).__name__}: {e}", flush=True)
+                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] RequestException: {type(e).__name__}: {e}", flush=True)
         except Exception as e:
             inc_counter("errors")
+            log_error_details(worker_id, i, r=r, params=params, exc=e)
             if i < max_print:
-                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] Unexpected error: {type(e).__name__}: {e}", flush=True)
+                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] Unexpected: {type(e).__name__}: {e}", flush=True)
 
         # pacing between requests (ms)
         delay_s = REQUEST_DELAY_MS / 1000.0
