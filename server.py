@@ -21,31 +21,59 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Environment configuration
 # -------------------------
 I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "false").strip().lower() == "true"
+
 ENDPOINT_URL = os.environ.get("ENDPOINT_URL", "https://example.com/api/test").strip()
 ORDER_NO = os.environ.get("ORDER_NO", "22811436844419928064")
 BNC = os.environ.get("BNC", "")
 METHOD = os.environ.get("METHOD", "GET").strip().upper()
 
-WORKER_THREADS = max(1, min(int(os.environ.get("WORKER_THREADS", "2")), int(os.environ.get("MAX_WORKERS", "200"))))
-BATCH_SIZE = max(1, min(int(os.environ.get("BATCH_SIZE", "43")), int(os.environ.get("MAX_BATCH_SIZE", "1000000"))))
-REQUEST_DELAY_MS = float(os.environ.get("REQUEST_DELAY_MS", "180"))
+try:
+    WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "2"))
+except Exception:
+    WORKER_THREADS = 2
+try:
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "43"))
+except Exception:
+    BATCH_SIZE = 43
+try:
+    REQUEST_DELAY_MS = float(os.environ.get("REQUEST_DELAY_MS", "180"))
+except Exception:
+    REQUEST_DELAY_MS = 180.0
+
 RUN_LOOP = os.environ.get("RUN_LOOP", "true").strip().lower() != "false"
-LOOP_PAUSE_SECS = float(os.environ.get("LOOP_PAUSE_SECS", "1"))
+
+try:
+    LOOP_PAUSE_SECS = float(os.environ.get("LOOP_PAUSE_SECS", "1"))
+except Exception:
+    LOOP_PAUSE_SECS = 1.0
+
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "200"))
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "1000000"))
+
 VERIFY_SSL = os.environ.get("VERIFY_SSL", "false").strip().lower() == "true"
 PRINT_LIMIT = int(os.environ.get("PRINT_LIMIT", "50"))
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "8"))
+
 COOKIE_NAME = os.environ.get("COOKIE_NAME", "BNC")
 REFERER = os.environ.get("REFERER", "https://example.com")
 ORIGIN = os.environ.get("ORIGIN", REFERER)
+
 SUMMARY_INTERVAL = float(os.environ.get("SUMMARY_INTERVAL", "10"))
 
-# Validate endpoint URL
+# enforce safety caps
+WORKER_THREADS = max(1, min(WORKER_THREADS, MAX_WORKERS))
+if BATCH_SIZE < 1:
+    BATCH_SIZE = 1
+if BATCH_SIZE > MAX_BATCH_SIZE:
+    print(f"[WARN] BATCH_SIZE capped from {BATCH_SIZE} to {MAX_BATCH_SIZE}", flush=True)
+    BATCH_SIZE = MAX_BATCH_SIZE
+
 _parsed = urlparse(ENDPOINT_URL)
 if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
     raise SystemExit(f"Bad ENDPOINT_URL: {ENDPOINT_URL}")
 
 # -------------------------
-# Keep-alive HTTP server
+# HTTP keep-alive server
 # -------------------------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -55,11 +83,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"PenTest runner alive")
 
 # -------------------------
-# Shared control objects
+# Shared objects
 # -------------------------
 stop_event = threading.Event()
 counters_lock = threading.Lock()
-counters = {"sent": 0, "success": 0, "status_counts": {}, "errors": 0}
+counters = {
+    "sent": 0,
+    "success": 0,
+    "status_counts": {},
+    "errors": 0
+}
 
 # -------------------------
 # Helper functions
@@ -105,7 +138,7 @@ def handle_rate_limit(response):
     return None
 
 def log_error_details(worker_id: int, i: int, r=None, params=None, exc=None):
-    print("=" * 80, flush=True)
+    print("="*80, flush=True)
     print(f"[DEBUG][worker-{worker_id}] Request #{i+1} detailed log:", flush=True)
     if exc:
         print(f"  Exception: {type(exc).__name__}: {exc}", flush=True)
@@ -124,7 +157,7 @@ def log_error_details(worker_id: int, i: int, r=None, params=None, exc=None):
             except Exception as e:
                 print(f"  Failed to read response body: {e}", flush=True)
         except Exception as e:
-            print(f"  Error inspecting response: {e}", flush=True)
+            print(f"  Error while inspecting response object: {e}", flush=True)
     if params:
         print(f"  Params/Body: {params}", flush=True)
     cookies = build_cookies()
@@ -132,7 +165,7 @@ def log_error_details(worker_id: int, i: int, r=None, params=None, exc=None):
         print(f"  Cookies: {cookies}", flush=True)
     headers = build_headers(worker_id)
     print(f"  Headers: {headers}", flush=True)
-    print("=" * 80, flush=True)
+    print("="*80, flush=True)
 
 # -------------------------
 # Worker logic
@@ -141,7 +174,7 @@ def send_requests_once(session: requests.Session, worker_id: int):
     headers = build_headers(worker_id)
     cookies = build_cookies()
     max_print = PRINT_LIMIT if BATCH_SIZE > 43 else BATCH_SIZE
-    print(f"[INFO][worker-{worker_id}] Sending {BATCH_SIZE} requests to: {ENDPOINT_URL}", flush=True)
+    print(f"[INFO][worker-{worker_id}] Sending 43 requests to: {ENDPOINT_URL}", flush=True)
 
     for i in range(BATCH_SIZE):
         if stop_event.is_set():
@@ -153,17 +186,29 @@ def send_requests_once(session: requests.Session, worker_id: int):
         try:
             params = build_params()
             if METHOD == "POST":
-                r = session.post(ENDPOINT_URL, headers=headers, cookies=cookies, json=params,
-                                 timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
+                r = session.post(
+                    ENDPOINT_URL,
+                    headers=headers,
+                    cookies=cookies,
+                    json=params,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=VERIFY_SSL,
+                )
             else:
-                r = session.get(ENDPOINT_URL, headers=headers, cookies=cookies, params=params,
-                                timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
+                r = session.get(
+                    ENDPOINT_URL,
+                    headers=headers,
+                    cookies=cookies,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=VERIFY_SSL,
+                )
 
             inc_counter("sent")
             with counters_lock:
                 counters["status_counts"][r.status_code] = counters["status_counts"].get(r.status_code, 0) + 1
                 if 200 <= r.status_code < 300:
-                    counters["success"] += 1
+                    counters["success"] = counters.get("success", 0) + 1
 
             if i < max_print:
                 print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] → {r.status_code}", flush=True)
@@ -173,7 +218,9 @@ def send_requests_once(session: requests.Session, worker_id: int):
                 log_error_details(worker_id, i, r=r, params=params)
 
             if r.status_code == 429:
-                wait = handle_rate_limit(r) or min(60, (2 ** min(i, 6)) * 0.5)
+                wait = handle_rate_limit(r)
+                if wait is None:
+                    wait = min(60, (2 ** min(i, 6)) * 0.5)
                 print(f"[worker-{worker_id}] 429 received, backing off {wait}s", flush=True)
                 t0 = time.time()
                 while (time.time() - t0) < wait:
@@ -184,9 +231,13 @@ def send_requests_once(session: requests.Session, worker_id: int):
         except requests.RequestException as e:
             inc_counter("errors")
             log_error_details(worker_id, i, r=r, params=params, exc=e)
+            if i < max_print:
+                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] RequestException: {type(e).__name__}: {e}", flush=True)
         except Exception as e:
             inc_counter("errors")
             log_error_details(worker_id, i, r=r, params=params, exc=e)
+            if i < max_print:
+                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] Unexpected: {type(e).__name__}: {e}", flush=True)
 
         # pacing
         delay_s = REQUEST_DELAY_MS / 1000.0
@@ -201,17 +252,20 @@ def send_requests_once(session: requests.Session, worker_id: int):
 def worker_loop(worker_id: int):
     session = requests.Session()
     session.headers.update({"Accept": "application/json"})
-    session.cookies.update(build_cookies())
     try:
+        session.cookies.update(build_cookies())
         while not stop_event.is_set():
             if not I_OWN_TARGET:
                 if worker_id == 1:
-                    print("[WARN] I_OWN_TARGET not true — traffic disabled.", flush=True)
+                    print("[WARN] I_OWN_TARGET not true — traffic sender disabled. Set env I_OWN_TARGET=true to enable.", flush=True)
                 time.sleep(5)
                 continue
+
             send_requests_once(session, worker_id)
             if not RUN_LOOP:
                 break
+
+            # pause between batches
             whole = int(LOOP_PAUSE_SECS)
             for _ in range(whole):
                 if stop_event.is_set():
@@ -225,7 +279,7 @@ def worker_loop(worker_id: int):
         print(f"[INFO][worker-{worker_id}] Exiting.", flush=True)
 
 # -------------------------
-# Summary reporter thread
+# Summary reporter
 # -------------------------
 def summary_reporter():
     last_sent = 0
@@ -269,7 +323,6 @@ if __name__ == "__main__":
         port = 10000
     httpd = HTTPServer(("", port), Handler)
     print(f"[SERVER] Keep-alive server listening on port {port}", flush=True)
-
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
