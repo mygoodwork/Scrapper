@@ -20,7 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # -------------------------
 # Environment configuration
 # -------------------------
-I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "false").strip().lower() == "true"
+I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "true").strip().lower() == "true"
 
 ENDPOINT_URL = os.environ.get("ENDPOINT_URL", "https://example.com/api/test").strip()
 ORDER_NO = os.environ.get("ORDER_NO", "22811436844419928064")
