@@ -55,7 +55,7 @@ PRINT_LIMIT = int(os.environ.get("PRINT_LIMIT", "50"))
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "8"))
 
 COOKIE_NAME = os.environ.get("COOKIE_NAME", "BNC")
-REFERER = os.environ.get("REFERER", "https://example.com")
+REFERER = os.environ.get("REFERER", "https://p2p.binance.com/en/trade/orderDetail?orderNo={ORDER_NO}")
 ORIGIN = os.environ.get("ORIGIN", REFERER)
 
 SUMMARY_INTERVAL = float(os.environ.get("SUMMARY_INTERVAL", "10"))
