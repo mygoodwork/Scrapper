@@ -1,340 +1,301 @@
-# server.py
-"""
-Safe combined penetration-test runner.
-
-REQUIREMENT: set I_OWN_TARGET=true in environment before enabling traffic.
-This script is intended to be used ONLY against systems you own or have written permission to test.
-"""
 import os
 import time
 import threading
-import signal
-import random
-import urllib3
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
 import requests
+import logging
+from typing import Dict, Optional
+from dataclasses import dataclass
+from contextlib import contextmanager
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s][%(asctime)s][%(threadName)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# -------------------------
-# Environment configuration
-# -------------------------
-I_OWN_TARGET = os.environ.get("I_OWN_TARGET", "true").strip().lower() == "true"
+# Configuration constants
+REQUEST_TIMEOUT = 8
+REQUEST_DELAY = 0.18
+MAX_PRINT_LINES = 50
+THREAD_JOIN_TIMEOUT = 5
+DEFAULT_BATCH_SIZE = 43
+DEFAULT_WORKER_THREADS = 4
+DEFAULT_LOOP_PAUSE = 1.0
+MAX_WORKER_THREADS = 100
+MAX_BATCH_SIZE = 1000
 
-ENDPOINT_URL = os.environ.get("ENDPOINT_URL", "https://example.com/api/test").strip()
-ORDER_NO = os.environ.get("ORDER_NO", "22811436844419928064")
-BNC = os.environ.get("BNC", "")
-METHOD = os.environ.get("METHOD", "GET").strip().upper()
+# Global metrics
+@dataclass
+class Metrics:
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    total_response_time: float = 0.0
+    errors_by_type: Dict[str, int] = None
+    
+    def __post_init__(self):
+        if self.errors_by_type is None:
+            self.errors_by_type = {}
+    
+    def record_success(self, response_time: float):
+        self.total_requests += 1
+        self.successful_requests += 1
+        self.total_response_time += response_time
+    
+    def record_failure(self, error_type: str):
+        self.total_requests += 1
+        self.failed_requests += 1
+        self.errors_by_type[error_type] = self.errors_by_type.get(error_type, 0) + 1
+    
+    def get_stats(self) -> dict:
+        avg_response_time = (
+            self.total_response_time / self.successful_requests 
+            if self.successful_requests > 0 else 0
+        )
+        success_rate = (
+            (self.successful_requests / self.total_requests * 100) 
+            if self.total_requests > 0 else 0
+        )
+        return {
+            'total_requests': self.total_requests,
+            'successful': self.successful_requests,
+            'failed': self.failed_requests,
+            'success_rate': f"{success_rate:.2f}%",
+            'avg_response_time': f"{avg_response_time:.3f}s",
+            'errors': self.errors_by_type
+        }
 
-try:
-    WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "2"))
-except Exception:
-    WORKER_THREADS = 2
-try:
-    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "43"))
-except Exception:
-    BATCH_SIZE = 43
-try:
-    REQUEST_DELAY_MS = float(os.environ.get("REQUEST_DELAY_MS", "180"))
-except Exception:
-    REQUEST_DELAY_MS = 180.0
+metrics = Metrics()
+metrics_lock = threading.Lock()
 
-RUN_LOOP = os.environ.get("RUN_LOOP", "true").strip().lower() != "false"
-
-try:
-    LOOP_PAUSE_SECS = float(os.environ.get("LOOP_PAUSE_SECS", "1"))
-except Exception:
-    LOOP_PAUSE_SECS = 1.0
-
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "200"))
-MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "1000000"))
-
-VERIFY_SSL = os.environ.get("VERIFY_SSL", "false").strip().lower() == "true"
-PRINT_LIMIT = int(os.environ.get("PRINT_LIMIT", "50"))
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "8"))
-
-COOKIE_NAME = os.environ.get("COOKIE_NAME", "BNC")
-REFERER = os.environ.get("REFERER", "https://p2p.binance.com/en/trade/orderDetail?orderNo={ORDER_NO}")
-ORIGIN = os.environ.get("ORIGIN", REFERER)
-
-SUMMARY_INTERVAL = float(os.environ.get("SUMMARY_INTERVAL", "10"))
-
-# enforce safety caps
-WORKER_THREADS = max(1, min(WORKER_THREADS, MAX_WORKERS))
-if BATCH_SIZE < 1:
-    BATCH_SIZE = 1
-if BATCH_SIZE > MAX_BATCH_SIZE:
-    print(f"[WARN] BATCH_SIZE capped from {BATCH_SIZE} to {MAX_BATCH_SIZE}", flush=True)
-    BATCH_SIZE = MAX_BATCH_SIZE
-
-_parsed = urlparse(ENDPOINT_URL)
-if _parsed.scheme not in ("http", "https") or not _parsed.netloc:
-    raise SystemExit(f"Bad ENDPOINT_URL: {ENDPOINT_URL}")
-
-# -------------------------
-# HTTP keep-alive server
-# -------------------------
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"PenTest runner alive")
-
-# -------------------------
-# Shared objects
-# -------------------------
-stop_event = threading.Event()
-counters_lock = threading.Lock()
-counters = {
-    "sent": 0,
-    "success": 0,
-    "status_counts": {},
-    "errors": 0
-}
-
-# -------------------------
-# Helper functions
-# -------------------------
-def inc_counter(key, subkey=None):
-    with counters_lock:
-        if subkey is None:
-            counters[key] = counters.get(key, 0) + 1
-        else:
-            if key not in counters:
-                counters[key] = {}
-            counters[key][subkey] = counters[key].get(subkey, 0) + 1
-
-def build_headers(worker_id: int):
-    return {
-        "User-Agent": f"Mozilla/5.0 (Linux; Android 13; Pixel 7) PentestWorker/{worker_id}",
-        "Accept": "application/json",
-        "Referer": REFERER,
-        "Origin": ORIGIN
-    }
-
-def build_cookies():
-    return {COOKIE_NAME: BNC} if BNC else {}
-
-def build_params():
-    return {
-        "orderNo": ORDER_NO,
-        "page": random.randint(1, 3),
-        "rows": 50,
-        "timestamp": int(time.time() * 1000),
-    }
-
-def handle_rate_limit(response):
-    ra = response.headers.get("Retry-After")
-    if ra:
-        try:
-            return float(ra)
-        except Exception:
-            try:
-                return int(ra)
-            except Exception:
-                return None
-    return None
-
-def log_error_details(worker_id: int, i: int, r=None, params=None, exc=None):
-    print("="*80, flush=True)
-    print(f"[DEBUG][worker-{worker_id}] Request #{i+1} detailed log:", flush=True)
-    if exc:
-        print(f"  Exception: {type(exc).__name__}: {exc}", flush=True)
-    if r is not None:
-        try:
-            print(f"  Status: {r.status_code}", flush=True)
-            try:
-                print(f"  Response headers: {dict(r.headers)}", flush=True)
-            except Exception:
-                pass
-            try:
-                content = r.text
-                if len(content) > 2000:
-                    content = content[:2000] + " ...[truncated]"
-                print(f"  Response body (up to 2000 chars):\n{content}", flush=True)
-            except Exception as e:
-                print(f"  Failed to read response body: {e}", flush=True)
-        except Exception as e:
-            print(f"  Error while inspecting response object: {e}", flush=True)
-    if params:
-        print(f"  Params/Body: {params}", flush=True)
-    cookies = build_cookies()
-    if cookies:
-        print(f"  Cookies: {cookies}", flush=True)
-    headers = build_headers(worker_id)
-    print(f"  Headers: {headers}", flush=True)
-    print("="*80, flush=True)
-
-# -------------------------
-# Worker logic
-# -------------------------
-def send_requests_once(session: requests.Session, worker_id: int):
-    headers = build_headers(worker_id)
-    cookies = build_cookies()
-    max_print = PRINT_LIMIT if BATCH_SIZE > 43 else BATCH_SIZE
-    print(f"[INFO][worker-{worker_id}] Sending 43 requests to: {ENDPOINT_URL}", flush=True)
-
-    for i in range(BATCH_SIZE):
-        if stop_event.is_set():
-            print(f"[INFO][worker-{worker_id}] Stop requested; aborting batch.", flush=True)
-            return
-
-        params = None
-        r = None
-        try:
-            params = build_params()
-            if METHOD == "POST":
-                r = session.post(
-                    ENDPOINT_URL,
-                    headers=headers,
-                    cookies=cookies,
-                    json=params,
-                    timeout=REQUEST_TIMEOUT,
-                    verify=VERIFY_SSL,
-                )
-            else:
-                r = session.get(
-                    ENDPOINT_URL,
-                    headers=headers,
-                    cookies=cookies,
-                    params=params,
-                    timeout=REQUEST_TIMEOUT,
-                    verify=VERIFY_SSL,
-                )
-
-            inc_counter("sent")
-            with counters_lock:
-                counters["status_counts"][r.status_code] = counters["status_counts"].get(r.status_code, 0) + 1
-                if 200 <= r.status_code < 300:
-                    counters["success"] = counters.get("success", 0) + 1
-
-            if i < max_print:
-                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] → {r.status_code}", flush=True)
-
-            if r.status_code >= 400:
-                inc_counter("errors")
-                log_error_details(worker_id, i, r=r, params=params)
-
-            if r.status_code == 429:
-                wait = handle_rate_limit(r)
-                if wait is None:
-                    wait = min(60, (2 ** min(i, 6)) * 0.5)
-                print(f"[worker-{worker_id}] 429 received, backing off {wait}s", flush=True)
-                t0 = time.time()
-                while (time.time() - t0) < wait:
-                    if stop_event.is_set():
-                        return
-                    time.sleep(0.5)
-
-        except requests.RequestException as e:
-            inc_counter("errors")
-            log_error_details(worker_id, i, r=r, params=params, exc=e)
-            if i < max_print:
-                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] RequestException: {type(e).__name__}: {e}", flush=True)
-        except Exception as e:
-            inc_counter("errors")
-            log_error_details(worker_id, i, r=r, params=params, exc=e)
-            if i < max_print:
-                print(f"[worker-{worker_id}] [{i+1}/{BATCH_SIZE}] Unexpected: {type(e).__name__}: {e}", flush=True)
-
-        # pacing
-        delay_s = REQUEST_DELAY_MS / 1000.0
-        slept = 0.0
-        while slept < delay_s:
-            if stop_event.is_set():
-                return
-            step = min(0.2, delay_s - slept)
-            time.sleep(step)
-            slept += step
-
-def worker_loop(worker_id: int):
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
+def validate_config():
+    """Validate environment configuration"""
+    global BATCH_SIZE, WORKER_THREADS, LOOP_PAUSE_SECS
+    
+    # Validate BATCH_SIZE
     try:
-        session.cookies.update(build_cookies())
-        while not stop_event.is_set():
-            if not I_OWN_TARGET:
-                if worker_id == 1:
-                    print("[WARN] I_OWN_TARGET not true — traffic sender disabled. Set env I_OWN_TARGET=true to enable.", flush=True)
-                time.sleep(5)
-                continue
+        BATCH_SIZE = int(os.environ.get("BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+        if BATCH_SIZE <= 0:
+            raise ValueError("BATCH_SIZE must be positive")
+        if BATCH_SIZE > MAX_BATCH_SIZE:
+            logger.warning(f"BATCH_SIZE {BATCH_SIZE} exceeds maximum {MAX_BATCH_SIZE}, capping")
+            BATCH_SIZE = MAX_BATCH_SIZE
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid BATCH_SIZE: {e}, falling back to {DEFAULT_BATCH_SIZE}")
+        BATCH_SIZE = DEFAULT_BATCH_SIZE
+    
+    # Validate WORKER_THREADS
+    try:
+        WORKER_THREADS = int(os.environ.get("WORKER_THREADS", str(DEFAULT_WORKER_THREADS)))
+        if WORKER_THREADS <= 0:
+            raise ValueError("WORKER_THREADS must be positive")
+        if WORKER_THREADS > MAX_WORKER_THREADS:
+            logger.warning(f"WORKER_THREADS {WORKER_THREADS} exceeds maximum {MAX_WORKER_THREADS}, capping")
+            WORKER_THREADS = MAX_WORKER_THREADS
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid WORKER_THREADS: {e}, falling back to {DEFAULT_WORKER_THREADS}")
+        WORKER_THREADS = DEFAULT_WORKER_THREADS
+    
+    # Validate LOOP_PAUSE_SECS
+    try:
+        LOOP_PAUSE_SECS = float(os.environ.get("LOOP_PAUSE_SECS", str(DEFAULT_LOOP_PAUSE)))
+        if LOOP_PAUSE_SECS < 0:
+            raise ValueError("LOOP_PAUSE_SECS cannot be negative")
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid LOOP_PAUSE_SECS: {e}, falling back to {DEFAULT_LOOP_PAUSE}")
+        LOOP_PAUSE_SECS = DEFAULT_LOOP_PAUSE
+    
+    logger.info(f"Configuration: BATCH_SIZE={BATCH_SIZE}, WORKER_THREADS={WORKER_THREADS}, LOOP_PAUSE_SECS={LOOP_PAUSE_SECS}")
 
-            send_requests_once(session, worker_id)
-            if not RUN_LOOP:
-                break
+# Initialize configuration
+validate_config()
 
-            # pause between batches
-            whole = int(LOOP_PAUSE_SECS)
-            for _ in range(whole):
-                if stop_event.is_set():
-                    break
-                time.sleep(1)
-            frac = LOOP_PAUSE_SECS - whole
-            if frac and not stop_event.is_set():
-                time.sleep(frac)
+@contextmanager
+def create_session():
+    """Create a properly configured requests session with connection pooling"""
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=20,
+        max_retries=requests.adapters.Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504]
+        )
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    
+    try:
+        yield session
     finally:
         session.close()
-        print(f"[INFO][worker-{worker_id}] Exiting.", flush=True)
 
-# -------------------------
-# Summary reporter
-# -------------------------
-def summary_reporter():
-    last_sent = 0
-    while not stop_event.is_set():
-        time.sleep(SUMMARY_INTERVAL)
-        with counters_lock:
-            sent = counters.get("sent", 0)
-            success = counters.get("success", 0)
-            errors = counters.get("errors", 0)
-            status_counts = counters.get("status_counts", {}).copy()
-        delta = sent - last_sent
-        last_sent = sent
-        print(f"[SUMMARY] sent_total={sent} sent_delta={delta} success={success} errors={errors} status_counts={status_counts}", flush=True)
+def make_request(session: requests.Session, url: str, headers: Optional[Dict[str, str]] = None) -> tuple[bool, float, Optional[str]]:
+    """
+    Make a single HTTP request and return success status, response time, and error if any
+    
+    Returns:
+        tuple: (success: bool, response_time: float, error_message: Optional[str])
+    """
+    start_time = time.time()
+    try:
+        response = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response_time = time.time() - start_time
+        
+        # Log response preview
+        try:
+            content = response.text[:MAX_PRINT_LINES] if len(response.text) > MAX_PRINT_LINES else response.text
+            logger.debug(f"Response ({response.status_code}): {content}")
+        except Exception as e:
+            logger.debug(f"Could not read response content: {e}")
+        
+        return True, response_time, None
+        
+    except requests.exceptions.Timeout:
+        response_time = time.time() - start_time
+        return False, response_time, "Timeout"
+    except requests.exceptions.ConnectionError as e:
+        response_time = time.time() - start_time
+        return False, response_time, "ConnectionError"
+    except requests.exceptions.RequestException as e:
+        response_time = time.time() - start_time
+        return False, response_time, f"RequestException: {type(e).__name__}"
+    except Exception as e:
+        response_time = time.time() - start_time
+        logger.error(f"Unexpected error: {e}")
+        return False, response_time, f"UnexpectedException: {type(e).__name__}"
 
-# -------------------------
-# Signal handling & main
-# -------------------------
-def handle_signal(signum, frame):
-    print(f"[INFO] Signal {signum} received → shutting down...", flush=True)
-    stop_event.set()
+def worker_thread(worker_id: int, url: str, headers: Optional[Dict[str, str]] = None):
+    """Worker thread that continuously sends requests to the target URL"""
+    logger.info(f"Worker {worker_id} started, sending {BATCH_SIZE} requests per batch to: {url}")
+    
+    with create_session() as session:
+        while True:
+            batch_start = time.time()
+            batch_success = 0
+            batch_failed = 0
+            
+            for i in range(BATCH_SIZE):
+                success, response_time, error = make_request(session, url, headers)
+                
+                # Update metrics
+                with metrics_lock:
+                    if success:
+                        metrics.record_success(response_time)
+                        batch_success += 1
+                    else:
+                        metrics.record_failure(error or "Unknown")
+                        batch_failed += 1
+                
+                # Rate limiting
+                time.sleep(REQUEST_DELAY)
+            
+            batch_time = time.time() - batch_start
+            logger.info(
+                f"Worker {worker_id} completed batch: "
+                f"{batch_success} success, {batch_failed} failed, "
+                f"took {batch_time:.2f}s"
+            )
+            
+            # Pause before next batch
+            time.sleep(LOOP_PAUSE_SECS)
 
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """HTTP handler for health checks and metrics"""
+    
+    def log_message(self, format, *args):
+        """Override to use our logger"""
+        logger.info(f"HTTP Request: {format % args}")
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            response = {
+                'status': 'healthy',
+                'active_threads': threading.active_count()
+            }
+            self.wfile.write(str(response).encode())
+            
+        elif self.path == '/metrics':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            with metrics_lock:
+                stats = metrics.get_stats()
+            
+            self.wfile.write(str(stats).encode())
+            
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found. Available endpoints: /health, /metrics')
 
-if __name__ == "__main__":
-    print("[START] PenTest runner starting...", flush=True)
+def main():
+    """Main entry point"""
+    # Get target URL and headers from environment
+    target_url = os.environ.get("TARGET_URL")
+    if not target_url:
+        logger.error("TARGET_URL environment variable is required")
+        return
+    
+    # Build headers
+    headers = {}
+    user_agent = os.environ.get("USER_AGENT")
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    
+    forwarded_for = os.environ.get("X_FORWARDED_FOR")
+    if forwarded_for:
+        headers["X-Forwarded-For"] = forwarded_for
+        logger.warning("X-Forwarded-For header is set - ensure this is for legitimate testing purposes")
+    
+    # Start worker threads
     threads = []
-
-    t_sum = threading.Thread(target=summary_reporter, daemon=True)
-    t_sum.start()
-
-    for wid in range(1, WORKER_THREADS + 1):
-        t = threading.Thread(target=worker_loop, args=(wid,), daemon=True)
+    logger.info(f"Starting {WORKER_THREADS} worker threads")
+    
+    for i in range(WORKER_THREADS):
+        t = threading.Thread(
+            target=worker_thread,
+            args=(i + 1, target_url, headers),
+            daemon=True,
+            name=f"Worker-{i+1}"
+        )
         t.start()
         threads.append(t)
-        print(f"[INFO] Started worker {wid}", flush=True)
-
+    
+    # Start HTTP server for health checks
+    port = 8000
     try:
-        port = int(os.environ.get("PORT", "10000"))
-    except Exception:
-        port = 10000
-    httpd = HTTPServer(("", port), Handler)
-    print(f"[SERVER] Keep-alive server listening on port {port}", flush=True)
-    try:
-        httpd.serve_forever()
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        logger.info(f"Health check server listening on port {port}")
+        logger.info(f"Available endpoints: http://localhost:{port}/health, http://localhost:{port}/metrics")
+        server.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        stop_event.set()
-        print("[SHUTDOWN] Waiting for workers to finish...", flush=True)
+        logger.info("Shutting down gracefully...")
+        server.shutdown()
+        
+        # Wait for threads to finish current work
         for t in threads:
-            t.join(timeout=5)
-        t_sum.join(timeout=1)
-        try:
-            httpd.shutdown()
-        except Exception:
-            pass
-        print("[EXIT] PenTest runner exited.", flush=True)
+            t.join(timeout=THREAD_JOIN_TIMEOUT)
+        
+        # Print final stats
+        with metrics_lock:
+            final_stats = metrics.get_stats()
+        logger.info(f"Final statistics: {final_stats}")
+        
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+
+if __name__ == "__main__":
+    main()
+        
