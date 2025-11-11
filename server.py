@@ -28,7 +28,7 @@ PROXIES = [
 ]
 
 # Input fields for PayPal email and password (replace these with target values)
-PAYPAL_EMAIL = "target_email@example.com"  # Replace with target PayPal email
+PAYPAL_EMAIL = "ogorchukwuf@gmail.com"  # Replace with target PayPal email
 PAYPAL_PASSWORD = "wrongpassword123"      # Replace with wrong password for failed logins
 
 # Hardcoded headers to mimic PayPal frontend browser request
