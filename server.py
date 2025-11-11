@@ -110,7 +110,7 @@ def hit_endpoint():
     session = requests.Session()
     
     # Create a cloudscraper instance for bypassing anti-bot measures
-    scraper = cloudscraper.create_scraper sess=session)
+    scraper = cloudscraper.create_scraper(sess=session)
     
     # Attempt to extract CSRF token if required
     csrf_token = extract_csrf_token(session)
