@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: server-22811-killer
-    env: python
-    region: oregon
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
-    autoDeploy: false
