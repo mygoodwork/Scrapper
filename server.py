@@ -125,7 +125,7 @@ BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers"
 
 async def fetch_bybit_pairs() -> Dict[str, float]:
     """
-    Fetch all spot pairs from Bybit.
+    Fetch all spot pairs from Bybit with detailed logging.
     Returns dict: {pair_name: price} e.g., {"BTCUSDT": 45000.0}
     """
     try:
@@ -142,29 +142,52 @@ async def fetch_bybit_pairs() -> Dict[str, float]:
                 if cursor:
                     params["cursor"] = cursor
                 
-                response = await client.get(BYBIT_SPOT_API_URL, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data.get("retCode") != 0:
+                try:
+                    response = await client.get(BYBIT_SPOT_API_URL, params=params)
+                except httpx.RequestError as e:
+                    # Network-level errors
+                    print("Bybit request failed:", str(e))
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Bybit API error: {data.get('retMsg', 'Unknown error')}"
+                        detail=f"Bybit request failed: {str(e)}"
+                    )
+
+                # Log response details
+                print("Bybit request URL:", response.url)
+                print("Status code:", response.status_code)
+                print("Response headers:", dict(response.headers))
+                try:
+                    resp_json = response.json()
+                    print("Response body:", resp_json)
+                except Exception:
+                    resp_json = None
+                    print("Response body is not JSON:", response.text)
+
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Bybit HTTP error: {str(e)}\nResponse body: {response.text}"
+                    )
+
+                if resp_json and resp_json.get("retCode") != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Bybit API error: {resp_json.get('retMsg', 'Unknown error')}"
                     )
                 
-                tickers = data.get("result", {}).get("list", [])
+                tickers = resp_json.get("result", {}).get("list", []) if resp_json else []
                 if not tickers:
                     break
                 
                 all_tickers.extend(tickers)
                 
-                # Check if there are more pages
-                next_cursor = data.get("result", {}).get("nextPageCursor", "")
+                next_cursor = resp_json.get("result", {}).get("nextPageCursor", "") if resp_json else ""
                 if not next_cursor:
                     break
                 cursor = next_cursor
             
-            # Convert to dict: symbol → price
             pairs = {}
             for ticker in all_tickers:
                 symbol = ticker.get("symbol", "")
@@ -177,12 +200,14 @@ async def fetch_bybit_pairs() -> Dict[str, float]:
                 except ValueError:
                     continue
             
+            print(f"Total pairs fetched: {len(pairs)}")
             return pairs
     
-    except httpx.HTTPError as e:
+    except Exception as e:
+        print("Unexpected error fetching Bybit pairs:", str(e))
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch Bybit data: {str(e)}"
+            detail=f"Unexpected error fetching Bybit pairs: {str(e)}"
         )
 
 
