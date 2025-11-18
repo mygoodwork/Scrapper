@@ -120,7 +120,7 @@ class CoinGraph:
 # Bybit API Integration
 # ============================================================================
 
-BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers?category=spot&limit=1000"
+BYBIT_SPOT_API_URL = "https://api.binance.com/api/v3/ticker/price"
 
 
 async def fetch_bybit_pairs() -> Dict[str, float]:
