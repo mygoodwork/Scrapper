@@ -121,55 +121,48 @@ class CoinGraph:
 # ============================================================================
 
 BYBIT_SPOT_API_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")  # read from environment variable
 
 
-async def fetch_bybit_pairs() -> Dict[str, float]:
+async def fetch_binance_pairs() -> Dict[str, float]:
     """
-    Fetch all spot pairs directly from Bybit.
+    Fetch all spot pairs directly from Binance using a read-only API key from environment.
     Returns dict: {pair_name: price} e.g., {"BTCUSDT": 45000.0}
     """
+    if not BINANCE_API_KEY:
+        raise HTTPException(status_code=500, detail="Binance API key not set in environment")
+
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            print(f"Fetching Bybit pairs from: {BYBIT_SPOT_API_URL}")
-            response = await client.get(BYBIT_SPOT_API_URL)
-            
-            print(f"Response status code: {response.status_code}")
-            print(f"Response headers: {response.headers}")
-            print(f"Raw response text (first 500 chars): {response.text[:500]}...")
-
+            response = await client.get(BINANCE_SPOT_API_URL, headers=headers)
             response.raise_for_status()
 
             try:
                 resp_json = response.json()
             except Exception as json_err:
-                print("Failed to parse JSON:", json_err)
                 raise HTTPException(status_code=500, detail=f"JSON parse error: {json_err}")
 
-            if resp_json.get("retCode") != 0:
-                print("Bybit API returned error:", resp_json.get("retMsg"))
-                raise HTTPException(status_code=500, detail=f"Bybit API error: {resp_json.get('retMsg')}")
-
-            tickers = resp_json.get("result", {}).get("list", [])
             pairs = {}
-            for ticker in tickers:
+            for ticker in resp_json:
                 symbol = ticker.get("symbol", "")
-                price_str = ticker.get("lastPrice", "0")
+                price_str = ticker.get("price", "0")
                 try:
                     price = float(price_str)
                     if price > 0:
                         pairs[symbol] = price
                 except ValueError:
-                    print(f"Invalid price for {symbol}: {price_str}")
+                    continue
 
-            print(f"Total pairs fetched: {len(pairs)}")
             return pairs
 
-    except Exception as e:
-        print("Error fetching pairs:", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching pairs: {str(e)}"
-        )
+
+async def get_or_refresh_binance_graph() -> Dict[str, float]:
+    """
+    Example function to get cached Binance pairs or refresh them.
+    """
+    return await fetch_binance_pairs()
 
 
 def extract_coins_from_pair(pair: str) -> Tuple[Optional[str], Optional[str]]:
