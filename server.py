@@ -120,22 +120,36 @@ class CoinGraph:
 # Bybit API Integration
 # ============================================================================
 
-BYBIT_SPOT_API_URL = "https://arbscap.netlify.app/api/fetch_bybit"
+BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers?category=spot&limit=1000"
 
 
 async def fetch_bybit_pairs() -> Dict[str, float]:
     """
-    Fetch all spot pairs via Netlify function.
+    Fetch all spot pairs directly from Bybit.
     Returns dict: {pair_name: price} e.g., {"BTCUSDT": 45000.0}
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            print(f"Fetching Bybit pairs from: {BYBIT_SPOT_API_URL}")
             response = await client.get(BYBIT_SPOT_API_URL)
+            
+            print(f"Response status code: {response.status_code}")
+            print(f"Response headers: {response.headers}")
+            print(f"Raw response text (first 500 chars): {response.text[:500]}...")
+
             response.raise_for_status()
-            resp_json = response.json()
-            
-            tickers = resp_json.get("result", {}).get("list", [])  # assuming Netlify returns original Bybit structure
-            
+
+            try:
+                resp_json = response.json()
+            except Exception as json_err:
+                print("Failed to parse JSON:", json_err)
+                raise HTTPException(status_code=500, detail=f"JSON parse error: {json_err}")
+
+            if resp_json.get("retCode") != 0:
+                print("Bybit API returned error:", resp_json.get("retMsg"))
+                raise HTTPException(status_code=500, detail=f"Bybit API error: {resp_json.get('retMsg')}")
+
+            tickers = resp_json.get("result", {}).get("list", [])
             pairs = {}
             for ticker in tickers:
                 symbol = ticker.get("symbol", "")
@@ -145,8 +159,8 @@ async def fetch_bybit_pairs() -> Dict[str, float]:
                     if price > 0:
                         pairs[symbol] = price
                 except ValueError:
-                    continue
-            
+                    print(f"Invalid price for {symbol}: {price_str}")
+
             print(f"Total pairs fetched: {len(pairs)}")
             return pairs
 
