@@ -120,7 +120,7 @@ class CoinGraph:
 # Bybit API Integration
 # ============================================================================
 
-BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers"
+BYBIT_SPOT_API_URL = "https://arbscap.netlify.app/api/fetch_bybit"
 
 
 async def fetch_bybit_pairs() -> Dict[str, float]:
