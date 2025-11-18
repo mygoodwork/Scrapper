@@ -1,10 +1,9 @@
 """
-FastAPI Backend for Manual Crypto Arbitrage System (v2)
-Fetches all spot pairs from Binance, builds a coin graph, and finds arbitrage opportunities with exact Binance pairs.
+FastAPI Backend for Real Binance Crypto Arbitrage System (v3)
+Fetches all spot pairs from Binance and finds arbitrage opportunities using only actual Binance pairs.
 Run: uvicorn server:app --reload
 """
 
-import asyncio
 import os
 import httpx
 from typing import Optional, Dict, List, Set, Tuple
@@ -18,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
 # ============================================================================
-# Data Models and Enums
+# Data Models
 # ============================================================================
 
 class ArbitrageMode(str, Enum):
@@ -41,7 +40,7 @@ class ArbitrageRequest(BaseModel):
 
 class PathOpportunity(BaseModel):
     path: List[str]
-    pairs: List[str]  # Binance symbols for each step
+    pairs: List[str]
     start_amount: float
     end_amount: float
     profit_percent: float
@@ -64,7 +63,7 @@ class ArbitrageResponse(BaseModel):
 class Edge:
     target: str
     price: float
-    pair_symbol: str  # store exact Binance symbol
+    pair_symbol: str
 
 class CoinGraph:
     def __init__(self):
@@ -76,44 +75,29 @@ class CoinGraph:
         self.all_coins.add(source)
         self.all_coins.add(target)
 
-    def add_pair(self, coin1: str, coin2: str, price: float, symbol: str):
-        self.add_edge(coin1, coin2, price, symbol)
+    def add_pair(self, base: str, quote: str, price: float, symbol: str):
+        self.add_edge(base, quote, price, symbol)
         if price > 0:
-            self.add_edge(coin2, coin1, 1 / price, symbol)
+            self.add_edge(quote, base, 1 / price, symbol)
 
     def get_neighbors(self, coin: str) -> List[Edge]:
         return self.graph.get(coin, [])
-
-    def coins_count(self) -> int:
-        return len(self.all_coins)
-
-    def pairs_count(self) -> int:
-        return sum(len(neighbors) for neighbors in self.graph.values())
 
 # ============================================================================
 # Binance API Integration
 # ============================================================================
 
 BINANCE_SPOT_API_URL = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 
 async def fetch_binance_pairs() -> Dict[str, float]:
-    if not BINANCE_API_KEY:
-        raise HTTPException(status_code=500, detail="Binance API key not set in environment")
-    
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(BINANCE_SPOT_API_URL, headers=headers)
+        response = await client.get(BINANCE_SPOT_API_URL)
         response.raise_for_status()
-        try:
-            resp_json = response.json()
-        except Exception as json_err:
-            raise HTTPException(status_code=500, detail=f"JSON parse error: {json_err}")
-    
+        data = response.json()
+
     pairs = {}
-    for ticker in resp_json:
-        symbol = ticker.get("symbol", "")
+    for ticker in data:
+        symbol = ticker.get("symbol")
         price_str = ticker.get("price", "0")
         try:
             price = float(price_str)
@@ -123,25 +107,20 @@ async def fetch_binance_pairs() -> Dict[str, float]:
             continue
     return pairs
 
-def extract_coins_from_pair(pair: str) -> Tuple[Optional[str], Optional[str]]:
-    suffixes = ["USDT", "USDC", "BUSD", "TUSD", "SUSD", "DAI", "USDE", "FDUSD",
-                "USD", "USDK", "USDJ", "DOGE", "BTC", "ETH", "BNB", "SOL"]
-    pair_upper = pair.upper()
-    for suffix in suffixes:
-        if pair_upper.endswith(suffix) and len(pair_upper) > len(suffix):
-            return pair_upper[:-len(suffix)], suffix
-    return None, None
-
 def build_graph_from_pairs(pairs: Dict[str, float]) -> CoinGraph:
     graph = CoinGraph()
+    # Only actual Binance pairs, detect base and quote
+    QUOTE_COINS = ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "SOL", "DOGE", "TRX", "XRP"]
     for symbol, price in pairs.items():
-        coin1, coin2 = extract_coins_from_pair(symbol)
-        if coin1 and coin2:
-            graph.add_pair(coin1, coin2, price, symbol)
+        for quote in QUOTE_COINS:
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                base = symbol[:-len(quote)]
+                graph.add_pair(base, quote, price, symbol)
+                break
     return graph
 
 # ============================================================================
-# DFS Arbitrage Path Finder
+# DFS Arbitrage Finder
 # ============================================================================
 
 POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
@@ -166,9 +145,9 @@ def find_paths_dfs(graph: CoinGraph, start_coin: str, mode: ArbitrageMode,
                 (mode == ArbitrageMode.BOTH)
             )
             if is_valid:
-                path_tuple = tuple(path)
-                if path_tuple not in visited_set:
-                    visited_set.add(path_tuple)
+                t = tuple(path)
+                if t not in visited_set:
+                    visited_set.add(t)
                     paths.append(path[:])
         if depth < max_depth:
             for edge in graph.get_neighbors(current):
@@ -180,8 +159,10 @@ def find_paths_dfs(graph: CoinGraph, start_coin: str, mode: ArbitrageMode,
     return paths
 
 # ============================================================================
-# Profit Calculation (No Fees)
+# Profit Calculation
 # ============================================================================
+
+TRADING_FEE = 0.001  # 0.1%
 
 def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> Tuple[float, float, List[str]]:
     amount = start_amount
@@ -191,17 +172,17 @@ def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> 
         target = path[i + 1].upper()
         edge = next((e for e in graph.get_neighbors(source) if e.target == target), None)
         if edge is None:
-            return 0, 0, []
-        amount *= edge.price
+            return 0, 0, []  # skip invalid path
+        amount *= (1 - TRADING_FEE) * edge.price
         pairs_in_path.append(edge.pair_symbol)
-    profit_percent = ((amount / start_amount) - 1) * 100
+    profit_percent = ((amount - start_amount) / start_amount) * 100
     return amount, profit_percent, pairs_in_path
 
 # ============================================================================
 # FastAPI App
 # ============================================================================
 
-app = FastAPI(title="Crypto Arbitrage Backend", version="1.0.0")
+app = FastAPI(title="Crypto Arbitrage Backend v3", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -215,22 +196,21 @@ _graph_timestamp: Optional[str] = None
 
 async def get_or_refresh_graph() -> Tuple[CoinGraph, str]:
     global _graph_cache, _graph_timestamp
-    if _graph_cache is None:
-        pairs = await fetch_binance_pairs()
-        _graph_cache = build_graph_from_pairs(pairs)
-        _graph_timestamp = datetime.utcnow().isoformat()
+    pairs = await fetch_binance_pairs()
+    _graph_cache = build_graph_from_pairs(pairs)
+    _graph_timestamp = datetime.utcnow().isoformat()
     return _graph_cache, _graph_timestamp
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "crypto-arbitrage-backend"}
+    return {"status": "healthy", "service": "crypto-arbitrage-backend-v3"}
 
 @app.get("/graph/info")
 async def graph_info():
     graph, timestamp = await get_or_refresh_graph()
     return {
-        "coins_count": graph.coins_count(),
-        "pairs_count": graph.pairs_count(),
+        "coins_count": len(graph.all_coins),
+        "pairs_count": sum(len(edges) for edges in graph.graph.values()),
         "popular_coins": list(POPULAR_COINS),
         "fetch_timestamp": timestamp
     }
@@ -241,21 +221,18 @@ async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
     start_coin_upper = request.start_coin.upper()
     if start_coin_upper not in graph.all_coins:
         raise HTTPException(status_code=400, detail=f"Coin '{request.start_coin}' not found")
-    
+
     paths = find_paths_dfs(graph, start_coin_upper, request.mode, max_depth=4, max_paths=500)
     opportunities: List[PathOpportunity] = []
 
     for path in paths:
         end_amount, profit_percent, pairs_in_path = calculate_profit(graph, path, request.start_amount)
-
-        # Include only profitable paths
         if profit_percent <= 0 or end_amount <= 0:
             continue
-
         opportunities.append(PathOpportunity(
             path=path,
             pairs=pairs_in_path,
-            start_amount=0,  # hide start amount
+            start_amount=request.start_amount,
             end_amount=round(end_amount, 8),
             profit_percent=round(profit_percent, 6),
             end_coin=path[-1],
@@ -266,7 +243,7 @@ async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
 
     return ArbitrageResponse(
         start_coin=start_coin_upper,
-        start_amount=0,  # hide start amount
+        start_amount=request.start_amount,
         mode=request.mode,
         opportunities=opportunities,
         total_count=len(opportunities),
@@ -275,16 +252,13 @@ async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
 
 @app.post("/arbitrage/refresh")
 async def refresh_graph():
-    global _graph_cache, _graph_timestamp
-    pairs = await fetch_binance_pairs()
-    _graph_cache = build_graph_from_pairs(pairs)
-    _graph_timestamp = datetime.utcnow().isoformat()
+    graph, timestamp = await get_or_refresh_graph()
     return {
         "status": "success",
         "message": "Graph refreshed",
-        "coins_count": _graph_cache.coins_count(),
-        "pairs_count": _graph_cache.pairs_count(),
-        "fetch_timestamp": _graph_timestamp
+        "coins_count": len(graph.all_coins),
+        "pairs_count": sum(len(edges) for edges in graph.graph.values()),
+        "fetch_timestamp": timestamp
     }
 
 # ============================================================================
