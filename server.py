@@ -5,6 +5,7 @@ Run: uvicorn server:app --reload
 """
 
 import asyncio
+import os
 import httpx
 from typing import Optional, Dict, List, Set, Tuple
 from enum import Enum
