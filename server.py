@@ -105,7 +105,7 @@ async def fetch_binance_pairs() -> Dict[str, float]:
         response = await client.get(BINANCE_SPOT_API_URL, headers=headers)
         response.raise_for_status()
         try:
-            resp_json = await response.json()
+            resp_json = response.json()
         except Exception as json_err:
             raise HTTPException(status_code=500, detail=f"JSON parse error: {json_err}")
     
