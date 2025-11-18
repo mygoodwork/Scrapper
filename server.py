@@ -125,74 +125,21 @@ BYBIT_SPOT_API_URL = "https://arbscap.netlify.app/api/fetch_bybit"
 
 async def fetch_bybit_pairs() -> Dict[str, float]:
     """
-    Fetch all spot pairs from Bybit with detailed logging.
+    Fetch all spot pairs via Netlify function.
     Returns dict: {pair_name: price} e.g., {"BTCUSDT": 45000.0}
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            params = {
-                "category": "spot",
-                "limit": 1000,
-            }
+            response = await client.get(BYBIT_SPOT_API_URL)
+            response.raise_for_status()
+            resp_json = response.json()
             
-            all_tickers = []
-            cursor = ""
-            
-            while True:
-                if cursor:
-                    params["cursor"] = cursor
-                
-                try:
-                    response = await client.get(BYBIT_SPOT_API_URL, params=params)
-                except httpx.RequestError as e:
-                    # Network-level errors
-                    print("Bybit request failed:", str(e))
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Bybit request failed: {str(e)}"
-                    )
-
-                # Log response details
-                print("Bybit request URL:", response.url)
-                print("Status code:", response.status_code)
-                print("Response headers:", dict(response.headers))
-                try:
-                    resp_json = response.json()
-                    print("Response body:", resp_json)
-                except Exception:
-                    resp_json = None
-                    print("Response body is not JSON:", response.text)
-
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Bybit HTTP error: {str(e)}\nResponse body: {response.text}"
-                    )
-
-                if resp_json and resp_json.get("retCode") != 0:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Bybit API error: {resp_json.get('retMsg', 'Unknown error')}"
-                    )
-                
-                tickers = resp_json.get("result", {}).get("list", []) if resp_json else []
-                if not tickers:
-                    break
-                
-                all_tickers.extend(tickers)
-                
-                next_cursor = resp_json.get("result", {}).get("nextPageCursor", "") if resp_json else ""
-                if not next_cursor:
-                    break
-                cursor = next_cursor
+            tickers = resp_json.get("result", {}).get("list", [])  # assuming Netlify returns original Bybit structure
             
             pairs = {}
-            for ticker in all_tickers:
+            for ticker in tickers:
                 symbol = ticker.get("symbol", "")
                 price_str = ticker.get("lastPrice", "0")
-                
                 try:
                     price = float(price_str)
                     if price > 0:
@@ -202,12 +149,12 @@ async def fetch_bybit_pairs() -> Dict[str, float]:
             
             print(f"Total pairs fetched: {len(pairs)}")
             return pairs
-    
+
     except Exception as e:
-        print("Unexpected error fetching Bybit pairs:", str(e))
+        print("Error fetching pairs:", str(e))
         raise HTTPException(
             status_code=500,
-            detail=f"Unexpected error fetching Bybit pairs: {str(e)}"
+            detail=f"Error fetching pairs: {str(e)}"
         )
 
 
