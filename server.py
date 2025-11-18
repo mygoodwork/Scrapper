@@ -1,5 +1,5 @@
 """
-FastAPI Backend for Manual Crypto Arbitrage System (v1)
+FastAPI Backend for Manual Crypto Arbitrage System (v2)
 Fetches all spot pairs from Binance, builds a coin graph, and finds arbitrage opportunities with exact Binance pairs.
 Run: uvicorn server:app --reload
 """
@@ -180,10 +180,8 @@ def find_paths_dfs(graph: CoinGraph, start_coin: str, mode: ArbitrageMode,
     return paths
 
 # ============================================================================
-# Profit Calculation
+# Profit Calculation (No Fees)
 # ============================================================================
-
-TRADING_FEE = 0.001
 
 def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> Tuple[float, float, List[str]]:
     amount = start_amount
@@ -194,9 +192,9 @@ def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> 
         edge = next((e for e in graph.get_neighbors(source) if e.target == target), None)
         if edge is None:
             return 0, 0, []
-        amount = amount * (1 - TRADING_FEE) * edge.price
+        amount *= edge.price
         pairs_in_path.append(edge.pair_symbol)
-    profit_percent = ((amount - start_amount) / start_amount) * 100
+    profit_percent = ((amount / start_amount) - 1) * 100
     return amount, profit_percent, pairs_in_path
 
 # ============================================================================
@@ -246,22 +244,29 @@ async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
     
     paths = find_paths_dfs(graph, start_coin_upper, request.mode, max_depth=4, max_paths=500)
     opportunities: List[PathOpportunity] = []
+
     for path in paths:
         end_amount, profit_percent, pairs_in_path = calculate_profit(graph, path, request.start_amount)
-        if end_amount > 0:
-            opportunities.append(PathOpportunity(
-                path=path,
-                pairs=pairs_in_path,
-                start_amount=request.start_amount,
-                end_amount=round(end_amount, 8),
-                profit_percent=round(profit_percent, 6),
-                end_coin=path[-1],
-                risk=get_risk_level(path[-1])
-            ))
+
+        # Include only profitable paths
+        if profit_percent <= 0 or end_amount <= 0:
+            continue
+
+        opportunities.append(PathOpportunity(
+            path=path,
+            pairs=pairs_in_path,
+            start_amount=0,  # hide start amount
+            end_amount=round(end_amount, 8),
+            profit_percent=round(profit_percent, 6),
+            end_coin=path[-1],
+            risk=get_risk_level(path[-1])
+        ))
+
     opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
+
     return ArbitrageResponse(
         start_coin=start_coin_upper,
-        start_amount=request.start_amount,
+        start_amount=0,  # hide start amount
         mode=request.mode,
         opportunities=opportunities,
         total_count=len(opportunities),
