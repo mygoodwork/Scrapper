@@ -1,5 +1,5 @@
 """
-FastAPI Backend using real Binance orderbooks for arbitrage detection (final corrected)
+FastAPI Backend using real Binance orderbooks for arbitrage detection (streaming + async parallel)
 Run: uvicorn server:app --reload
 """
 
@@ -10,10 +10,12 @@ from typing import Optional, Dict, List, Set, Tuple
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 
 # ----------------------------
@@ -22,9 +24,9 @@ from pydantic import BaseModel, Field, validator
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"  # ?symbol=SYMBOL&limit=5
 ORDERBOOK_LIMIT = 5
-TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))  # default 0.1% per trade
-# Quote coin candidates (order matters: longer tokens first)
+TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))
 QUOTE_COINS = ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "SOL", "DOGE", "TRX", "XRP", "ADA"]
+ORDERBOOK_TTL_SECONDS = 2  # cache for 2s
 
 # ----------------------------
 # Models
@@ -70,16 +72,12 @@ class ArbitrageResponse(BaseModel):
 @dataclass
 class Edge:
     target: str
-    pair_symbol: str  # e.g., "BTCUSDT"
-    # price not stored here because we'll use orderbook bids/asks for live prices
+    pair_symbol: str
 
 class CoinGraph:
     def __init__(self):
-        # adjacency: coin -> list of edges
         self.graph: Dict[str, List[Edge]] = defaultdict(list)
-        # set of coins discovered
         self.all_coins: Set[str] = set()
-        # mapping (base, quote) -> symbol string
         self.symbol_map: Dict[Tuple[str, str], str] = {}
 
     def add_pair(self, base: str, quote: str, symbol: str):
@@ -87,14 +85,12 @@ class CoinGraph:
         quote_u = quote.upper()
         if base_u == quote_u:
             return
-        # forward: base -> quote  (selling base -> receive quote at bid)
         self.graph[base_u].append(Edge(target=quote_u, pair_symbol=symbol))
-        # reverse: quote -> base (buying base with quote at ask)
         self.graph[quote_u].append(Edge(target=base_u, pair_symbol=symbol))
         self.all_coins.add(base_u)
         self.all_coins.add(quote_u)
         self.symbol_map[(base_u, quote_u)] = symbol
-        self.symbol_map[(quote_u, base_u)] = symbol  # same symbol used for both directions
+        self.symbol_map[(quote_u, base_u)] = symbol
 
     def get_neighbors(self, coin: str) -> List[Edge]:
         return self.graph.get(coin.upper(), [])
@@ -103,37 +99,35 @@ class CoinGraph:
 # Binance helpers
 # ----------------------------
 async def fetch_all_binance_symbols() -> Dict[str, float]:
-    """Fetch all ticker prices (we use this to discover available symbols)."""
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(BINANCE_TICKER_URL)
         r.raise_for_status()
         data = r.json()
-    # data is list of {symbol, price}
     pairs: Dict[str, float] = {}
     for entry in data:
         sym = entry.get("symbol")
-        price_str = entry.get("price", "0")
         try:
-            price = float(price_str)
+            price = float(entry.get("price", "0"))
             if price > 0:
                 pairs[sym] = price
         except Exception:
             continue
     return pairs
 
+# Global orderbook cache with TTL
+_orderbook_global_cache: Dict[str, Tuple[float, float, datetime]] = {}
+
 async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Optional[Tuple[float, float]]:
-    """
-    Fetch best (bid, ask) for a symbol from Binance orderbook.
-    Returns (best_bid, best_ask) as floats.
-    Returns None if symbol not found or error.
-    """
+    now = datetime.utcnow()
+    cached = _orderbook_global_cache.get(symbol)
+    if cached and (now - cached[2]).total_seconds() < ORDERBOOK_TTL_SECONDS:
+        return cached[0], cached[1]
+
     params = {"symbol": symbol, "limit": ORDERBOOK_LIMIT}
     try:
         r = await client.get(BINANCE_ORDERBOOK_URL, params=params)
         r.raise_for_status()
         data = r.json()
-    except httpx.HTTPStatusError:
-        return None
     except Exception:
         return None
 
@@ -144,33 +138,29 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
     try:
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
+        _orderbook_global_cache[symbol] = (best_bid, best_ask, now)
         return best_bid, best_ask
     except Exception:
         return None
 
 # ----------------------------
-# Build graph only from real Binance symbols
+# Build graph from symbols
 # ----------------------------
 def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
     graph = CoinGraph()
-    # iterate all returned symbols, attempt to split into base/quote using QUOTE_COINS
     for sym in symbols.keys():
         sym_u = sym.upper()
-        matched = False
         for q in QUOTE_COINS:
             if sym_u.endswith(q) and len(sym_u) > len(q):
                 base = sym_u[: len(sym_u) - len(q)]
                 quote = q
-                # ignore if base empty or equals quote
                 if base and base != quote:
                     graph.add_pair(base, quote, sym_u)
-                    matched = True
                 break
-        # if not matched, skip (exotic or unknown quoting)
     return graph
 
 # ----------------------------
-# Path finding (DFS)
+# DFS paths
 # ----------------------------
 POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
 
@@ -198,7 +188,7 @@ def find_paths_dfs(
                 ok = end == start
             elif mode == ArbitrageMode.POPULAR_END:
                 ok = end.upper() in POPULAR_COINS
-            else:  # BOTH
+            else:
                 ok = True
             if ok:
                 t = tuple(path)
@@ -207,7 +197,6 @@ def find_paths_dfs(
                     paths.append(path.copy())
         if depth < max_depth:
             for edge in graph.get_neighbors(current):
-                # avoid immediate back-and-forth
                 if len(path) <= 1 or edge.target != path[-2]:
                     path.append(edge.target)
                     dfs(edge.target, path, depth + 1)
@@ -217,86 +206,65 @@ def find_paths_dfs(
     return paths
 
 # ----------------------------
-# Profit simulation using real orderbooks
+# Async path profit simulation (with prefetch cache)
 # ----------------------------
-async def simulate_path_profit(
+async def simulate_path_profit_with_cache(
     graph: CoinGraph,
     path: List[str],
     start_amount: float,
-    orderbook_cache: Dict[str, Tuple[float, float]],
-    client: httpx.AsyncClient,
-    trading_fee: float = TRADING_FEE
-) -> Tuple[float, float, List[str]]:
-    """
-    Simulate trades along path using best bid/ask per symbol.
-    - orderbook_cache: symbol -> (bid, ask)
-    Returns (end_amount, profit_percent, pairs_used) or (0,0,[]) if any missing.
-    """
-    amount = float(start_amount)
+    orderbook_cache: Dict[str, Tuple[float, float]]
+) -> Optional[PathOpportunity]:
+    amount = start_amount
     pairs_used: List[str] = []
 
-    # For each leg from source -> target
     for i in range(len(path) - 1):
         source = path[i].upper()
         target = path[i + 1].upper()
-        # find symbol for (source,target)
         symbol = graph.symbol_map.get((source, target))
         if not symbol:
-            # No direct symbol: path invalid
-            return 0.0, 0.0, []
+            return None
 
-        # fetch orderbook best prices (cached)
-        if symbol not in orderbook_cache:
-            ob = await fetch_orderbook_best(symbol, client)
-            if not ob:
-                return 0.0, 0.0, []
-            orderbook_cache[symbol] = ob
-        best_bid, best_ask = orderbook_cache[symbol]  # floats
+        # Fetch from cache or fresh
+        if symbol in orderbook_cache:
+            best_bid, best_ask = orderbook_cache[symbol]
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                best = await fetch_orderbook_best(symbol, client)
+                if not best:
+                    return None
+                best_bid, best_ask = best
+                orderbook_cache[symbol] = best_bid, best_ask
 
-        # Determine conversion type:
-        # If symbol is BASE+QUOTE (e.g., BTCUSDT) and we are converting QUOTE -> BASE (USDT->BTC),
-        # we must BUY BASE at the ASK: base_amount = quote_amount / ask
-        # If converting BASE -> QUOTE (BTC->USDT), we SELL BASE at the BID: quote_amount = base_amount * bid
-        # Because graph.symbol_map has same symbol for both (source,target) directions, we need to know base/quote:
-        # derive base/quote from symbol using QUOTE_COINS
-        sym_u = symbol.upper()
-        base = None
-        quote = None
+        # Identify base/quote
+        base, quote = None, None
         for q in QUOTE_COINS:
-            if sym_u.endswith(q) and len(sym_u) > len(q):
-                base = sym_u[: len(sym_u) - len(q)]
+            if symbol.upper().endswith(q) and len(symbol) > len(q):
+                base = symbol[: len(symbol) - len(q)]
                 quote = q
                 break
-        if base is None or quote is None:
-            return 0.0, 0.0, []
+        if not base or not quote:
+            return None
 
-        # Case 1: source == quote and target == base => buy base using quote (use ask)
+        # Conversion
         if source == quote and target == base:
-            ask = best_ask
-            if ask <= 0:
-                return 0.0, 0.0, []
-            # amount (in quote) -> base
-            # apply fee on the notional? commonly fee applied on traded amount; we'll subtract fee on result:
-            base_amount = amount / ask
-            # apply fee (we assume fee applied on each trade value; for simplicity we multiply by (1 - fee))
-            base_amount = base_amount * (1 - trading_fee)
-            amount = base_amount  # now in base units
-        # Case 2: source == base and target == quote => sell base to get quote (use bid)
+            amount = (amount / best_ask) * (1 - TRADING_FEE)
         elif source == base and target == quote:
-            bid = best_bid
-            if bid <= 0:
-                return 0.0, 0.0, []
-            quote_amount = amount * bid
-            quote_amount = quote_amount * (1 - trading_fee)
-            amount = quote_amount
+            amount = (amount * best_bid) * (1 - TRADING_FEE)
         else:
-            # Not matching expected base/quote arrangement; path invalid
-            return 0.0, 0.0, []
+            return None
 
         pairs_used.append(symbol)
 
-    profit_percent = ((amount - start_amount) / start_amount) * 100 if start_amount > 0 else 0.0
-    return amount, profit_percent, pairs_used
+    profit_percent = ((amount - start_amount) / start_amount) * 100
+    return PathOpportunity(
+        path=path,
+        pairs=pairs_used,
+        start_amount=start_amount,
+        end_amount=round(amount, 12),
+        profit_percent=round(profit_percent, 8),
+        end_coin=path[-1],
+        risk=get_risk_level(path[-1])
+    )
 
 # ----------------------------
 # FastAPI app
@@ -341,51 +309,50 @@ async def refresh_graph():
     graph, timestamp = await get_or_refresh_graph(force=True)
     return {"status": "success", "fetch_timestamp": timestamp, "coins_count": len(graph.all_coins)}
 
-@app.post("/arbitrage/calculate", response_model=ArbitrageResponse)
-async def calculate_arbitrage(request: ArbitrageRequest, limit: int = Query(500, ge=1, le=5000)):
-    """
-    Calculate arbitrage opportunities.
-    - Uses live orderbook best bid/ask for price simulation.
-    - `limit` sets max candidate paths to evaluate (safety).
-    """
+@app.post("/arbitrage/calculate/stream")
+async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Query(500, ge=1, le=5000)):
     graph, fetch_timestamp = await get_or_refresh_graph()
     start_coin = request.start_coin.upper()
     if start_coin not in graph.all_coins:
         raise HTTPException(status_code=400, detail=f"Start coin '{start_coin}' not available in Binance pairs")
 
     candidate_paths = find_paths_dfs(graph, start_coin, request.mode, max_depth=4, max_paths=limit)
-    opportunities: List[PathOpportunity] = []
 
-    # We'll reuse a single HTTP client and an orderbook cache for this request
+    # Prefetch all symbols
+    symbols_needed: Set[str] = set()
+    for path in candidate_paths:
+        for i in range(len(path) - 1):
+            s, t = path[i].upper(), path[i + 1].upper()
+            sym = graph.symbol_map.get((s, t))
+            if sym:
+                symbols_needed.add(sym)
+
     orderbook_cache: Dict[str, Tuple[float, float]] = {}
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # Evaluate paths (sequentially). Could be parallelized but beware rate limiting.
-        for path in candidate_paths:
-            end_amount, profit_percent, pairs_used = await simulate_path_profit(
-                graph, path, request.start_amount, orderbook_cache, client, trading_fee=TRADING_FEE
-            )
-            # include only profitable paths
-            if profit_percent > 0 and end_amount > 0 and pairs_used:
-                opportunities.append(PathOpportunity(
-                    path=path,
-                    pairs=pairs_used,
-                    start_amount=request.start_amount,
-                    end_amount=round(end_amount, 12),
-                    profit_percent=round(profit_percent, 8),
-                    end_coin=path[-1],
-                    risk=get_risk_level(path[-1])
-                ))
+        async def fetch_sym(sym):
+            best = await fetch_orderbook_best(sym, client)
+            if best:
+                orderbook_cache[sym] = best
+        await asyncio.gather(*(fetch_sym(sym) for sym in symbols_needed))
 
-    # sort by profit desc
-    opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
-    return ArbitrageResponse(
-        start_coin=start_coin,
-        start_amount=request.start_amount,
-        mode=request.mode,
-        opportunities=opportunities,
-        total_count=len(opportunities),
-        fetch_timestamp=fetch_timestamp,
-    )
+    # Streaming generator
+    async def generator():
+        yield '{"start_coin": "%s", "start_amount": %f, "mode": "%s", "opportunities": [' % (
+            start_coin, request.start_amount, request.mode
+        )
+        first = True
+        tasks = [simulate_path_profit_with_cache(graph, path, request.start_amount, orderbook_cache) for path in candidate_paths]
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            if res and res.profit_percent > 0:
+                if not first:
+                    yield ","
+                else:
+                    first = False
+                yield json.dumps(res.dict())
+        yield '], "total_count": null, "fetch_timestamp": "%s"}' % fetch_timestamp
+
+    return StreamingResponse(generator(), media_type="application/json")
 
 # ----------------------------
 # Run
