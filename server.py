@@ -1,6 +1,6 @@
 """
-FastAPI Backend for Manual Crypto Arbitrage System (v0)
-Fetches all spot pairs from Binance, builds a coin graph, and finds arbitrage opportunities.
+FastAPI Backend for Manual Crypto Arbitrage System (v1)
+Fetches all spot pairs from Binance, builds a coin graph, and finds arbitrage opportunities with exact Binance pairs.
 Run: uvicorn server:app --reload
 """
 
@@ -41,6 +41,7 @@ class ArbitrageRequest(BaseModel):
 
 class PathOpportunity(BaseModel):
     path: List[str]
+    pairs: List[str]  # Binance symbols for each step
     start_amount: float
     end_amount: float
     profit_percent: float
@@ -63,21 +64,22 @@ class ArbitrageResponse(BaseModel):
 class Edge:
     target: str
     price: float
+    pair_symbol: str  # store exact Binance symbol
 
 class CoinGraph:
     def __init__(self):
         self.graph: Dict[str, List[Edge]] = defaultdict(list)
         self.all_coins: Set[str] = set()
 
-    def add_edge(self, source: str, target: str, price: float):
-        self.graph[source].append(Edge(target=target, price=price))
+    def add_edge(self, source: str, target: str, price: float, pair_symbol: str):
+        self.graph[source].append(Edge(target=target, price=price, pair_symbol=pair_symbol))
         self.all_coins.add(source)
         self.all_coins.add(target)
 
-    def add_pair(self, coin1: str, coin2: str, price: float):
-        self.add_edge(coin1, coin2, price)
+    def add_pair(self, coin1: str, coin2: str, price: float, symbol: str):
+        self.add_edge(coin1, coin2, price, symbol)
         if price > 0:
-            self.add_edge(coin2, coin1, 1 / price)
+            self.add_edge(coin2, coin1, 1 / price, symbol)
 
     def get_neighbors(self, coin: str) -> List[Edge]:
         return self.graph.get(coin, [])
@@ -132,10 +134,10 @@ def extract_coins_from_pair(pair: str) -> Tuple[Optional[str], Optional[str]]:
 
 def build_graph_from_pairs(pairs: Dict[str, float]) -> CoinGraph:
     graph = CoinGraph()
-    for pair, price in pairs.items():
-        coin1, coin2 = extract_coins_from_pair(pair)
+    for symbol, price in pairs.items():
+        coin1, coin2 = extract_coins_from_pair(symbol)
         if coin1 and coin2:
-            graph.add_pair(coin1, coin2, price)
+            graph.add_pair(coin1, coin2, price, symbol)
     return graph
 
 # ============================================================================
@@ -183,18 +185,19 @@ def find_paths_dfs(graph: CoinGraph, start_coin: str, mode: ArbitrageMode,
 
 TRADING_FEE = 0.001
 
-def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> Tuple[float, float]:
+def calculate_profit(graph: CoinGraph, path: List[str], start_amount: float) -> Tuple[float, float, List[str]]:
     amount = start_amount
+    pairs_in_path = []
     for i in range(len(path) - 1):
         source = path[i].upper()
         target = path[i + 1].upper()
-        edges = graph.get_neighbors(source)
-        price = next((e.price for e in edges if e.target == target), None)
-        if price is None:
-            return 0, 0
-        amount = amount * (1 - TRADING_FEE) * price
+        edge = next((e for e in graph.get_neighbors(source) if e.target == target), None)
+        if edge is None:
+            return 0, 0, []
+        amount = amount * (1 - TRADING_FEE) * edge.price
+        pairs_in_path.append(edge.pair_symbol)
     profit_percent = ((amount - start_amount) / start_amount) * 100
-    return amount, profit_percent
+    return amount, profit_percent, pairs_in_path
 
 # ============================================================================
 # FastAPI App
@@ -244,10 +247,11 @@ async def calculate_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
     paths = find_paths_dfs(graph, start_coin_upper, request.mode, max_depth=4, max_paths=500)
     opportunities: List[PathOpportunity] = []
     for path in paths:
-        end_amount, profit_percent = calculate_profit(graph, path, request.start_amount)
+        end_amount, profit_percent, pairs_in_path = calculate_profit(graph, path, request.start_amount)
         if end_amount > 0:
             opportunities.append(PathOpportunity(
                 path=path,
+                pairs=pairs_in_path,
                 start_amount=request.start_amount,
                 end_amount=round(end_amount, 8),
                 profit_percent=round(profit_percent, 6),
