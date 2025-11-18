@@ -337,7 +337,7 @@ async def get_or_refresh_graph() -> Tuple[CoinGraph, str]:
     global _graph_cache, _graph_timestamp
     
     if _graph_cache is None:
-        pairs = await fetch_bybit_pairs()
+        pairs = await fetch_binance_pairs()
         _graph_cache = build_graph_from_pairs(pairs)
         _graph_timestamp = datetime.utcnow().isoformat()
     
@@ -444,7 +444,7 @@ async def refresh_graph():
     global _graph_cache, _graph_timestamp
     
     try:
-        pairs = await fetch_bybit_pairs()
+        pairs = await fetch_binance_pairs()
         _graph_cache = build_graph_from_pairs(pairs)
         _graph_timestamp = datetime.utcnow().isoformat()
         
