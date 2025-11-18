@@ -272,7 +272,10 @@ async def simulate_path_profit_with_cache(
 app = FastAPI(title="Binance Orderbook Arbitrage", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://scrapper-h4xe.onrender.com",
+        "https://arbitragecruo.netlify.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
