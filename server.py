@@ -120,7 +120,7 @@ class CoinGraph:
 # Bybit API Integration
 # ============================================================================
 
-BYBIT_SPOT_API_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_SPOT_API_URL = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")  # read from environment variable
 
 
