@@ -1,5 +1,5 @@
 """
-FastAPI Backend using real Binance orderbooks for 3-step triangular arbitrage detection (streaming + async parallel)
+FastAPI Backend using real Binance orderbooks for 4-step circular arbitrage detection (streaming + async parallel)
 Run: uvicorn server:app --reload
 """
 
@@ -159,7 +159,7 @@ def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
     return graph
 
 # ----------------------------
-# DFS paths (3-step triangles only)
+# DFS paths (4-step circular arbitrage only)
 # ----------------------------
 POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
 
@@ -183,16 +183,10 @@ def find_paths_dfs(
     def dfs(current: str, path: List[str]):
         if len(paths) >= max_paths:
             return
-        if len(path) == 3:
+        
+        if len(path) == 4:
             end = path[-1]
-            ok = False
-            if mode == ArbitrageMode.START_ONLY:
-                ok = end == start
-            elif mode == ArbitrageMode.POPULAR_END:
-                ok = end.upper() in POPULAR_COINS
-            else:
-                ok = True
-            if ok:
+            if end == start:
                 t = tuple(path)
                 if t not in seen:
                     seen.add(t)
@@ -201,10 +195,18 @@ def find_paths_dfs(
         
         neighbors = sort_neighbors(graph.get_neighbors(current))
         for edge in neighbors[:15]:
-            if len(path) <= 1 or edge.target != path[-2]:
-                path.append(edge.target)
-                dfs(edge.target, path)
-                path.pop()
+            if len(path) == 3:
+                # On last leg, only consider paths back to start
+                if edge.target == start:
+                    path.append(edge.target)
+                    dfs(edge.target, path)
+                    path.pop()
+            else:
+                # Don't revisit previous coin (except when closing the loop)
+                if len(path) <= 1 or edge.target != path[-2]:
+                    path.append(edge.target)
+                    dfs(edge.target, path)
+                    path.pop()
 
     dfs(start, [start])
     return paths
@@ -251,6 +253,9 @@ def simulate_path_profit_sync(
 
         pairs_used.append(symbol)
 
+    if amount <= start_amount:
+        return None
+    
     profit_percent = ((amount - start_amount) / start_amount) * 100
     return PathOpportunity(
         path=path,
@@ -265,7 +270,7 @@ def simulate_path_profit_sync(
 # ----------------------------
 # FastAPI app
 # ----------------------------
-app = FastAPI(title="Binance 3-Step Arbitrage", version="1.0.0")
+app = FastAPI(title="Binance 4-Step Circular Arbitrage", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -352,7 +357,7 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
         
         for path in candidate_paths:
             res = simulate_path_profit_sync(graph, path, request.start_amount, orderbook_cache)
-            if res and res.profit_percent > 0:
+            if res:  # Already filtered for profit > 0 inside function
                 opportunities.append(res)
         
         opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
@@ -383,4 +388,4 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-    
+        
