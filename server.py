@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, validator
 # ----------------------------
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"  # ?symbol=SYMBOL&limit=5
-ORDERBOOK_LIMIT = 5
+ORDERBOOK_LIMIT = 500  # increased from 5 to 500 for deeper orderbook data
 TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))
 QUOTE_COINS = ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "SOL", "DOGE", "TRX", "XRP", "ADA"]
 ORDERBOOK_TTL_SECONDS = 10  # cache for 10s instead of 2s
@@ -114,13 +114,17 @@ async def fetch_all_binance_symbols() -> Dict[str, float]:
             continue
     return pairs
 
-_orderbook_global_cache: Dict[str, Tuple[float, float, datetime]] = {}
+_orderbook_global_cache: Dict[str, Tuple[float, float, float, float, datetime]] = {}
 
-async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Optional[Tuple[float, float]]:
+async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Fetch orderbook and return (best_bid, best_ask, weighted_bid, weighted_ask).
+    Weighted prices are based on cumulative volume in first 5% of orderbook depth.
+    """
     now = datetime.utcnow()
     cached = _orderbook_global_cache.get(symbol)
-    if cached and (now - cached[2]).total_seconds() < ORDERBOOK_TTL_SECONDS:
-        return cached[0], cached[1]
+    if cached and (now - cached[4]).total_seconds() < ORDERBOOK_TTL_SECONDS:
+        return cached[0], cached[1], cached[2], cached[3]
 
     params = {"symbol": symbol, "limit": ORDERBOOK_LIMIT}
     try:
@@ -134,11 +138,39 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
     asks = data.get("asks", [])
     if not bids or not asks:
         return None
+    
     try:
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
-        _orderbook_global_cache[symbol] = (best_bid, best_ask, now)
-        return best_bid, best_ask
+        
+        # Weighted bid: cumulative volume-weighted price
+        bid_total_volume = sum(float(b[1]) for b in bids)
+        weighted_bid_threshold = bid_total_volume * 0.05  # First 5% of depth
+        bid_cumulative = 0
+        weighted_bid = best_bid
+        
+        for bid_price, bid_volume in bids:
+            bid_volume_f = float(bid_volume)
+            bid_cumulative += bid_volume_f
+            weighted_bid = float(bid_price)
+            if bid_cumulative >= weighted_bid_threshold:
+                break
+        
+        # Weighted ask: cumulative volume-weighted price
+        ask_total_volume = sum(float(a[1]) for a in asks)
+        weighted_ask_threshold = ask_total_volume * 0.05  # First 5% of depth
+        ask_cumulative = 0
+        weighted_ask = best_ask
+        
+        for ask_price, ask_volume in asks:
+            ask_volume_f = float(ask_volume)
+            ask_cumulative += ask_volume_f
+            weighted_ask = float(ask_price)
+            if ask_cumulative >= weighted_ask_threshold:
+                break
+        
+        _orderbook_global_cache[symbol] = (best_bid, best_ask, weighted_bid, weighted_ask, now)
+        return best_bid, best_ask, weighted_bid, weighted_ask
     except Exception:
         return None
 
@@ -146,16 +178,21 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
 # Build graph from symbols
 # ----------------------------
 def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
+    """
+    Remove QUOTE_COINS restriction.
+    Now treats every symbol as (base, quote) by trying all possible splits (longest quote first).
+    This includes ALL Binance pairs, not just those ending in USDT/BTC/ETH/etc.
+    """
     graph = CoinGraph()
     for sym in symbols.keys():
         sym_u = sym.upper()
-        for q in QUOTE_COINS:
-            if sym_u.endswith(q) and len(sym_u) > len(q):
-                base = sym_u[: len(sym_u) - len(q)]
-                quote = q
-                if base and base != quote:
-                    graph.add_pair(base, quote, sym_u)
-                break
+        # Try all possible base/quote splits, starting from longest quote
+        for quote_len in range(len(sym_u) - 1, 0, -1):
+            quote = sym_u[-quote_len:]
+            base = sym_u[:-quote_len]
+            if base and base != quote and len(base) > 0:
+                graph.add_pair(base, quote, sym_u)
+                break  # Use the longest quote match and stop
     return graph
 
 # ----------------------------
@@ -218,8 +255,13 @@ def simulate_path_profit_sync(
     graph: CoinGraph,
     path: List[str],
     start_amount: float,
-    orderbook_cache: Dict[str, Tuple[float, float]]
+    orderbook_cache: Dict[str, Tuple[float, float, float, float]]
 ) -> Optional[PathOpportunity]:
+    """
+    Removed trading fee multiplier (1 - TRADING_FEE).
+    Now calculates pure profit without fees for theoretical maximum arbitrage detection.
+    Uses weighted average prices from orderbook depth.
+    """
     amount = start_amount
     pairs_used: List[str] = []
 
@@ -233,7 +275,7 @@ def simulate_path_profit_sync(
         if symbol not in orderbook_cache:
             return None
         
-        best_bid, best_ask = orderbook_cache[symbol]
+        best_bid, best_ask, weighted_bid, weighted_ask = orderbook_cache[symbol]
 
         base, quote = None, None
         for q in QUOTE_COINS:
@@ -244,10 +286,11 @@ def simulate_path_profit_sync(
         if not base or not quote:
             return None
 
+        # Use weighted prices instead of best bid/ask
         if source == quote and target == base:
-            amount = (amount / best_ask) * (1 - TRADING_FEE)
+            amount = amount / weighted_ask  # removed * (1 - TRADING_FEE)
         elif source == base and target == quote:
-            amount = (amount * best_bid) * (1 - TRADING_FEE)
+            amount = amount * weighted_bid  # removed * (1 - TRADING_FEE)
         else:
             return None
 
@@ -331,7 +374,7 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
             if sym:
                 symbols_needed.add(sym)
 
-    orderbook_cache: Dict[str, Tuple[float, float]] = {}
+    orderbook_cache: Dict[str, Tuple[float, float, float, float]] = {}
     semaphore = asyncio.Semaphore(50)  # Limit concurrent requests
     
     async with httpx.AsyncClient(timeout=8.0) as client:
@@ -421,7 +464,7 @@ async def scan_all_arbitrage_stream(
             if sym:
                 symbols_needed.add(sym)
     
-    orderbook_cache: Dict[str, Tuple[float, float]] = {}
+    orderbook_cache: Dict[str, Tuple[float, float, float, float]] = {}
     semaphore = asyncio.Semaphore(50)
     
     async with httpx.AsyncClient(timeout=8.0) as client:
@@ -480,4 +523,4 @@ async def scan_all_arbitrage_stream(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-    
+        
