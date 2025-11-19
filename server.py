@@ -355,7 +355,14 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
                 yield json.dumps(res.dict())
         yield '], "total_count": null, "fetch_timestamp": "%s"}' % fetch_timestamp
 
-    return StreamingResponse(generator(), media_type="application/json")
+    response = StreamingResponse(generator(), media_type="application/json")
+    # Explicit CORS headers for streaming response
+    response.headers["Access-Control-Allow-Origin"] = "https://arbitragecruo.netlify.app"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+
+    return response
 
 # ----------------------------
 # Run
