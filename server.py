@@ -22,11 +22,12 @@ from pydantic import BaseModel, Field, validator
 # Config
 # ----------------------------
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"  # ?symbol=SYMBOL&limit=5
-ORDERBOOK_LIMIT = 500  # increased from 5 to 500 for deeper orderbook data
+BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"
+ORDERBOOK_LIMIT = 500
 TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))
 QUOTE_COINS = ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "SOL", "DOGE", "TRX", "XRP", "ADA"]
-ORDERBOOK_TTL_SECONDS = 10  # cache for 10s instead of 2s
+ORDERBOOK_TTL_SECONDS = 10
+MIN_PROFIT_PERCENT = 0.1
 
 # ----------------------------
 # Models
@@ -73,24 +74,26 @@ class ArbitrageResponse(BaseModel):
 class Edge:
     target: str
     pair_symbol: str
+    base: str
+    quote: str
 
 class CoinGraph:
     def __init__(self):
         self.graph: Dict[str, List[Edge]] = defaultdict(list)
         self.all_coins: Set[str] = set()
-        self.symbol_map: Dict[Tuple[str, str], str] = {}
+        self.symbol_map: Dict[Tuple[str, str], Tuple[str, str, str]] = {}  # (base_upper, quote_upper) -> (symbol, base, quote)
 
     def add_pair(self, base: str, quote: str, symbol: str):
         base_u = base.upper()
         quote_u = quote.upper()
         if base_u == quote_u:
             return
-        self.graph[base_u].append(Edge(target=quote_u, pair_symbol=symbol))
-        self.graph[quote_u].append(Edge(target=base_u, pair_symbol=symbol))
+        self.graph[base_u].append(Edge(target=quote_u, pair_symbol=symbol, base=base_u, quote=quote_u))
+        self.graph[quote_u].append(Edge(target=base_u, pair_symbol=symbol, base=quote_u, quote=base_u))
         self.all_coins.add(base_u)
         self.all_coins.add(quote_u)
-        self.symbol_map[(base_u, quote_u)] = symbol
-        self.symbol_map[(quote_u, base_u)] = symbol
+        self.symbol_map[(base_u, quote_u)] = (symbol, base_u, quote_u)
+        self.symbol_map[(quote_u, base_u)] = (symbol, quote_u, base_u)
 
     def get_neighbors(self, coin: str) -> List[Edge]:
         return self.graph.get(coin.upper(), [])
@@ -98,20 +101,27 @@ class CoinGraph:
 # ----------------------------
 # Binance helpers
 # ----------------------------
-async def fetch_all_binance_symbols() -> Dict[str, float]:
+async def fetch_all_binance_symbols() -> Dict[str, Tuple[str, str]]:
+    """
+    Returns dict of symbol -> (base, quote) pairs instead of just symbol -> price.
+    This is obtained by intelligently parsing Binance symbol naming conventions.
+    """
     async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(BINANCE_TICKER_URL)
+        r = await client.get("https://api.binance.com/api/v3/exchangeInfo")
         r.raise_for_status()
         data = r.json()
-    pairs: Dict[str, float] = {}
-    for entry in data:
-        sym = entry.get("symbol")
-        try:
-            price = float(entry.get("price", "0"))
-            if price > 0:
-                pairs[sym] = price
-        except Exception:
+    
+    pairs: Dict[str, Tuple[str, str]] = {}
+    for symbol_obj in data.get("symbols", []):
+        if symbol_obj.get("status") != "TRADING":
             continue
+        symbol = symbol_obj.get("symbol", "")
+        base = symbol_obj.get("baseAsset", "")
+        quote = symbol_obj.get("quoteAsset", "")
+        if symbol and base and quote:
+            pairs[symbol] = (base, quote)
+    
+    print(f"[v0] Fetched {len(pairs)} Binance trading pairs from exchangeInfo")
     return pairs
 
 _orderbook_global_cache: Dict[str, Tuple[float, float, float, float, datetime]] = {}
@@ -131,7 +141,8 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
         r = await client.get(BINANCE_ORDERBOOK_URL, params=params)
         r.raise_for_status()
         data = r.json()
-    except Exception:
+    except Exception as e:
+        print(f"[v0] Failed to fetch orderbook for {symbol}: {e}")
         return None
 
     bids = data.get("bids", [])
@@ -143,9 +154,8 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
         
-        # Weighted bid: cumulative volume-weighted price
         bid_total_volume = sum(float(b[1]) for b in bids)
-        weighted_bid_threshold = bid_total_volume * 0.05  # First 5% of depth
+        weighted_bid_threshold = bid_total_volume * 0.05
         bid_cumulative = 0
         weighted_bid = best_bid
         
@@ -156,9 +166,8 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
             if bid_cumulative >= weighted_bid_threshold:
                 break
         
-        # Weighted ask: cumulative volume-weighted price
         ask_total_volume = sum(float(a[1]) for a in asks)
-        weighted_ask_threshold = ask_total_volume * 0.05  # First 5% of depth
+        weighted_ask_threshold = ask_total_volume * 0.05
         ask_cumulative = 0
         weighted_ask = best_ask
         
@@ -171,28 +180,24 @@ async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Option
         
         _orderbook_global_cache[symbol] = (best_bid, best_ask, weighted_bid, weighted_ask, now)
         return best_bid, best_ask, weighted_bid, weighted_ask
-    except Exception:
+    except Exception as e:
+        print(f"[v0] Error parsing orderbook for {symbol}: {e}")
         return None
 
 # ----------------------------
 # Build graph from symbols
 # ----------------------------
-def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
+def build_graph_from_symbols(symbols: Dict[str, Tuple[str, str]]) -> CoinGraph:
     """
-    Remove QUOTE_COINS restriction.
-    Now treats every symbol as (base, quote) by trying all possible splits (longest quote first).
-    This includes ALL Binance pairs, not just those ending in USDT/BTC/ETH/etc.
+    Now receives proper base/quote pairs from exchangeInfo instead of trying to parse them.
+    This eliminates ambiguity (e.g., is BNBUSDT BNB/USDT or BNU/BUST?).
+    All Binance pairs are included without QUOTE_COINS filtering.
     """
     graph = CoinGraph()
-    for sym in symbols.keys():
-        sym_u = sym.upper()
-        # Try all possible base/quote splits, starting from longest quote
-        for quote_len in range(len(sym_u) - 1, 0, -1):
-            quote = sym_u[-quote_len:]
-            base = sym_u[:-quote_len]
-            if base and base != quote and len(base) > 0:
-                graph.add_pair(base, quote, sym_u)
-                break  # Use the longest quote match and stop
+    for symbol, (base, quote) in symbols.items():
+        graph.add_pair(base, quote, symbol)
+    
+    print(f"[v0] Built graph with {len(graph.all_coins)} coins and {sum(len(e) for e in graph.graph.values())} edges")
     return graph
 
 # ----------------------------
@@ -207,13 +212,12 @@ def find_paths_dfs(
     graph: CoinGraph,
     start_coin: str,
     mode: ArbitrageMode,
-    max_paths: int = 300  # reduced from 500
+    max_paths: int = 300
 ) -> List[List[str]]:
     start = start_coin.upper()
     paths: List[List[str]] = []
     seen = set()
     
-    # Prioritize popular coins first for faster path finding
     def sort_neighbors(edges: List[Edge]) -> List[Edge]:
         return sorted(edges, key=lambda e: 0 if e.target in POPULAR_COINS else 1)
 
@@ -233,23 +237,22 @@ def find_paths_dfs(
         neighbors = sort_neighbors(graph.get_neighbors(current))
         for edge in neighbors[:15]:
             if len(path) == 3:
-                # On last leg, only consider paths back to start
                 if edge.target == start:
                     path.append(edge.target)
                     dfs(edge.target, path)
                     path.pop()
             else:
-                # Don't revisit previous coin (except when closing the loop)
                 if len(path) <= 1 or edge.target != path[-2]:
                     path.append(edge.target)
                     dfs(edge.target, path)
                     path.pop()
 
     dfs(start, [start])
+    print(f"[v0] Found {len(paths)} paths from {start}")
     return paths
 
 # ----------------------------
-# Async path profit simulation - OPTIMIZED
+# Async path profit simulation - FIXED
 # ----------------------------
 def simulate_path_profit_sync(
     graph: CoinGraph,
@@ -258,9 +261,9 @@ def simulate_path_profit_sync(
     orderbook_cache: Dict[str, Tuple[float, float, float, float]]
 ) -> Optional[PathOpportunity]:
     """
-    Removed trading fee multiplier (1 - TRADING_FEE).
-    Now calculates pure profit without fees for theoretical maximum arbitrage detection.
-    Uses weighted average prices from orderbook depth.
+    Completely rewritten to use proper base/quote from graph edges.
+    Now correctly handles multi-leg trades without QUOTE_COINS filtering.
+    Uses weighted average prices; no trading fees applied.
     """
     amount = start_amount
     pairs_used: List[str] = []
@@ -268,38 +271,45 @@ def simulate_path_profit_sync(
     for i in range(len(path) - 1):
         source = path[i].upper()
         target = path[i + 1].upper()
-        symbol = graph.symbol_map.get((source, target))
-        if not symbol:
+        
+        edge = None
+        for e in graph.get_neighbors(source):
+            if e.target == target:
+                edge = e
+                break
+        
+        if not edge:
             return None
-
+        
+        symbol = edge.pair_symbol
+        
         if symbol not in orderbook_cache:
             return None
         
         best_bid, best_ask, weighted_bid, weighted_ask = orderbook_cache[symbol]
 
-        base, quote = None, None
-        for q in QUOTE_COINS:
-            if symbol.upper().endswith(q) and len(symbol) > len(q):
-                base = symbol[: len(symbol) - len(q)]
-                quote = q
-                break
-        if not base or not quote:
-            return None
-
-        # Use weighted prices instead of best bid/ask
-        if source == quote and target == base:
-            amount = amount / weighted_ask  # removed * (1 - TRADING_FEE)
-        elif source == base and target == quote:
-            amount = amount * weighted_bid  # removed * (1 - TRADING_FEE)
+        # If source is base, we're buying quote with base (multiply by bid)
+        # If source is quote, we're selling quote for base (divide by ask)
+        if source == edge.base and target == edge.quote:
+            # Trading base for quote: amount * bid price
+            amount = amount * weighted_bid
+        elif source == edge.quote and target == edge.base:
+            # Trading quote for base: amount / ask price
+            amount = amount / weighted_ask
         else:
+            print(f"[v0] Direction mismatch for {symbol}: source={source}, target={target}, edge.base={edge.base}, edge.quote={edge.quote}")
             return None
 
         pairs_used.append(symbol)
 
-    if amount <= start_amount:
+    if amount <= start_amount * 1.0001:  # Allow tiny profit threshold
         return None
     
     profit_percent = ((amount - start_amount) / start_amount) * 100
+    
+    if profit_percent < MIN_PROFIT_PERCENT:
+        return None
+    
     return PathOpportunity(
         path=path,
         pairs=pairs_used,
@@ -327,7 +337,7 @@ app.add_middleware(
 
 _graph_cache: Optional[CoinGraph] = None
 _graph_timestamp: Optional[str] = None
-_last_symbol_snapshot: Optional[Dict[str, float]] = None
+_last_symbol_snapshot: Optional[Dict[str, Tuple[str, str]]] = None
 
 async def get_or_refresh_graph(force: bool = False) -> Tuple[CoinGraph, str]:
     global _graph_cache, _graph_timestamp, _last_symbol_snapshot
@@ -347,7 +357,7 @@ async def graph_info():
     graph, timestamp = await get_or_refresh_graph()
     return {
         "coins_count": len(graph.all_coins),
-        "pairs_count": sum(len(edges) for edges in graph.graph.values()),
+        "pairs_count": sum(len(edges) for edges in graph.graph.values()) // 2,  # Divide by 2 since bidirectional
         "fetch_timestamp": timestamp,
     }
 
@@ -364,18 +374,19 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
         raise HTTPException(status_code=400, detail=f"Start coin '{start_coin}' not available in Binance pairs")
 
     candidate_paths = find_paths_dfs(graph, start_coin, request.mode, max_paths=min(limit, 300))
+    print(f"[v0] Scanning {len(candidate_paths)} paths for {start_coin}")
 
-    # Prefetch all symbols with aggressive timeout
     symbols_needed: Set[str] = set()
     for path in candidate_paths:
         for i in range(len(path) - 1):
             s, t = path[i].upper(), path[i + 1].upper()
-            sym = graph.symbol_map.get((s, t))
-            if sym:
-                symbols_needed.add(sym)
+            for edge in graph.get_neighbors(s):
+                if edge.target == t:
+                    symbols_needed.add(edge.pair_symbol)
+                    break
 
     orderbook_cache: Dict[str, Tuple[float, float, float, float]] = {}
-    semaphore = asyncio.Semaphore(50)  # Limit concurrent requests
+    semaphore = asyncio.Semaphore(50)
     
     async with httpx.AsyncClient(timeout=8.0) as client:
         async def fetch_sym(sym):
@@ -385,28 +396,30 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
                     if best:
                         orderbook_cache[sym] = best
                 except Exception:
-                    pass  # Skip failed fetches
+                    pass
         
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(fetch_sym(sym) for sym in symbols_needed), return_exceptions=True),
-                timeout=5.0  # Max 5 seconds for all orderbook fetches
+                timeout=5.0
             )
         except asyncio.TimeoutError:
-            pass  # Continue with whatever we fetched
+            pass
+    
+    print(f"[v0] Fetched orderbooks for {len(orderbook_cache)} symbols")
 
     async def generator():
         opportunities = []
         
         for path in candidate_paths:
             res = simulate_path_profit_sync(graph, path, request.start_amount, orderbook_cache)
-            if res:  # Already filtered for profit > 0 inside function
+            if res:
                 opportunities.append(res)
         
         opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
         opportunities = opportunities[:50]
+        print(f"[v0] Found {len(opportunities)} profitable opportunities for {start_coin}")
         
-        # Stream results
         yield '{"start_coin": "%s", "start_amount": %f, "mode": "%s", "opportunities": [' % (
             start_coin, request.start_amount, request.mode
         )
@@ -432,11 +445,9 @@ async def scan_all_arbitrage_stream(
 ):
     """
     Automatically scan ALL circular arbitrage opportunities across all popular coins.
-    No need to specify start coin - system detects all profitable circular paths.
     """
     graph, fetch_timestamp = await get_or_refresh_graph()
     
-    # Scan from all popular starting coins
     start_coins = list(POPULAR_COINS)
     all_paths = []
     
@@ -446,23 +457,24 @@ async def scan_all_arbitrage_stream(
         paths = find_paths_dfs(graph, start_coin, ArbitrageMode.START_ONLY, max_paths=100)
         all_paths.extend(paths)
     
-    # Remove duplicates
     unique_paths = []
     seen = set()
     for path in all_paths:
-        normalized = tuple(sorted(path))
-        if normalized not in seen:
-            seen.add(normalized)
+        t = tuple(path)
+        if t not in seen:
+            seen.add(t)
             unique_paths.append(path)
     
-    # Prefetch orderbooks
+    print(f"[v0] Total unique paths to scan: {len(unique_paths)}")
+    
     symbols_needed: Set[str] = set()
     for path in unique_paths:
         for i in range(len(path) - 1):
             s, t = path[i].upper(), path[i + 1].upper()
-            sym = graph.symbol_map.get((s, t))
-            if sym:
-                symbols_needed.add(sym)
+            for edge in graph.get_neighbors(s):
+                if edge.target == t:
+                    symbols_needed.add(edge.pair_symbol)
+                    break
     
     orderbook_cache: Dict[str, Tuple[float, float, float, float]] = {}
     semaphore = asyncio.Semaphore(50)
@@ -485,22 +497,20 @@ async def scan_all_arbitrage_stream(
         except asyncio.TimeoutError:
             pass
     
-    # Calculate all opportunities
+    print(f"[v0] Fetched orderbooks for {len(orderbook_cache)} symbols out of {len(symbols_needed)}")
+    
     async def generator():
         opportunities = []
         
         for path in unique_paths:
-            # Use the first coin as start amount reference
-            start_coin_for_path = path[0]
             res = simulate_path_profit_sync(graph, path, start_amount, orderbook_cache)
             if res:
                 opportunities.append(res)
         
-        # Sort by profit
         opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
         opportunities = opportunities[:limit]
+        print(f"[v0] Found {len(opportunities)} opportunities after filtering")
         
-        # Stream response
         yield '{"opportunities": ['
         
         for idx, opp in enumerate(opportunities):
