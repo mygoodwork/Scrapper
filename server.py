@@ -382,10 +382,102 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
+@app.get("/arbitrage/scan/stream")
+async def scan_all_arbitrage_stream(
+    start_amount: float = Query(1000, gt=0),
+    limit: int = Query(50, ge=1, le=200)
+):
+    """
+    Automatically scan ALL circular arbitrage opportunities across all popular coins.
+    No need to specify start coin - system detects all profitable circular paths.
+    """
+    graph, fetch_timestamp = await get_or_refresh_graph()
+    
+    # Scan from all popular starting coins
+    start_coins = list(POPULAR_COINS)
+    all_paths = []
+    
+    for start_coin in start_coins:
+        if start_coin not in graph.all_coins:
+            continue
+        paths = find_paths_dfs(graph, start_coin, ArbitrageMode.START_ONLY, max_paths=100)
+        all_paths.extend(paths)
+    
+    # Remove duplicates
+    unique_paths = []
+    seen = set()
+    for path in all_paths:
+        normalized = tuple(sorted(path))
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_paths.append(path)
+    
+    # Prefetch orderbooks
+    symbols_needed: Set[str] = set()
+    for path in unique_paths:
+        for i in range(len(path) - 1):
+            s, t = path[i].upper(), path[i + 1].upper()
+            sym = graph.symbol_map.get((s, t))
+            if sym:
+                symbols_needed.add(sym)
+    
+    orderbook_cache: Dict[str, Tuple[float, float]] = {}
+    semaphore = asyncio.Semaphore(50)
+    
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        async def fetch_sym(sym):
+            async with semaphore:
+                try:
+                    best = await fetch_orderbook_best(sym, client)
+                    if best:
+                        orderbook_cache[sym] = best
+                except Exception:
+                    pass
+        
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(fetch_sym(sym) for sym in symbols_needed), return_exceptions=True),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            pass
+    
+    # Calculate all opportunities
+    async def generator():
+        opportunities = []
+        
+        for path in unique_paths:
+            # Use the first coin as start amount reference
+            start_coin_for_path = path[0]
+            res = simulate_path_profit_sync(graph, path, start_amount, orderbook_cache)
+            if res:
+                opportunities.append(res)
+        
+        # Sort by profit
+        opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
+        opportunities = opportunities[:limit]
+        
+        # Stream response
+        yield '{"opportunities": ['
+        
+        for idx, opp in enumerate(opportunities):
+            if idx > 0:
+                yield ","
+            yield json.dumps(opp.dict())
+        
+        yield '], "total_count": %d, "fetch_timestamp": "%s"}' % (len(opportunities), fetch_timestamp)
+    
+    response = StreamingResponse(generator(), media_type="application/json")
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
 # ----------------------------
 # Run
 # ----------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-        
+    
