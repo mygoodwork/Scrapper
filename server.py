@@ -1,5 +1,5 @@
 """
-FastAPI Backend using real Binance orderbooks for arbitrage detection (streaming + async parallel)
+FastAPI Backend using real Binance orderbooks for 3-step triangular arbitrage detection (streaming + async parallel)
 Run: uvicorn server:app --reload
 """
 
@@ -10,7 +10,7 @@ from typing import Optional, Dict, List, Set, Tuple
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 
 from fastapi import FastAPI, HTTPException, Query
@@ -114,7 +114,6 @@ async def fetch_all_binance_symbols() -> Dict[str, float]:
             continue
     return pairs
 
-# Global orderbook cache with TTL
 _orderbook_global_cache: Dict[str, Tuple[float, float, datetime]] = {}
 
 async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Optional[Tuple[float, float]]:
@@ -160,7 +159,7 @@ def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
     return graph
 
 # ----------------------------
-# DFS paths
+# DFS paths (3-step triangles only)
 # ----------------------------
 POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
 
@@ -171,17 +170,16 @@ def find_paths_dfs(
     graph: CoinGraph,
     start_coin: str,
     mode: ArbitrageMode,
-    max_depth: int = 4,
     max_paths: int = 500
 ) -> List[List[str]]:
     start = start_coin.upper()
     paths: List[List[str]] = []
     seen = set()
 
-    def dfs(current: str, path: List[str], depth: int):
+    def dfs(current: str, path: List[str]):
         if len(paths) >= max_paths:
             return
-        if len(path) >= 3:
+        if len(path) == 3:  # exactly 3-step path
             end = path[-1]
             ok = False
             if mode == ArbitrageMode.START_ONLY:
@@ -195,18 +193,18 @@ def find_paths_dfs(
                 if t not in seen:
                     seen.add(t)
                     paths.append(path.copy())
-        if depth < max_depth:
-            for edge in graph.get_neighbors(current):
-                if len(path) <= 1 or edge.target != path[-2]:
-                    path.append(edge.target)
-                    dfs(edge.target, path, depth + 1)
-                    path.pop()
+            return
+        for edge in graph.get_neighbors(current):
+            if len(path) <= 1 or edge.target != path[-2]:
+                path.append(edge.target)
+                dfs(edge.target, path)
+                path.pop()
 
-    dfs(start, [start], 0)
+    dfs(start, [start])
     return paths
 
 # ----------------------------
-# Async path profit simulation (with prefetch cache)
+# Async path profit simulation
 # ----------------------------
 async def simulate_path_profit_with_cache(
     graph: CoinGraph,
@@ -224,7 +222,6 @@ async def simulate_path_profit_with_cache(
         if not symbol:
             return None
 
-        # Fetch from cache or fresh
         if symbol in orderbook_cache:
             best_bid, best_ask = orderbook_cache[symbol]
         else:
@@ -235,7 +232,6 @@ async def simulate_path_profit_with_cache(
                 best_bid, best_ask = best
                 orderbook_cache[symbol] = best_bid, best_ask
 
-        # Identify base/quote
         base, quote = None, None
         for q in QUOTE_COINS:
             if symbol.upper().endswith(q) and len(symbol) > len(q):
@@ -245,7 +241,6 @@ async def simulate_path_profit_with_cache(
         if not base or not quote:
             return None
 
-        # Conversion
         if source == quote and target == base:
             amount = (amount / best_ask) * (1 - TRADING_FEE)
         elif source == base and target == quote:
@@ -269,7 +264,7 @@ async def simulate_path_profit_with_cache(
 # ----------------------------
 # FastAPI app
 # ----------------------------
-app = FastAPI(title="Binance Orderbook Arbitrage", version="1.0.0")
+app = FastAPI(title="Binance 3-Step Arbitrage", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -319,7 +314,7 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
     if start_coin not in graph.all_coins:
         raise HTTPException(status_code=400, detail=f"Start coin '{start_coin}' not available in Binance pairs")
 
-    candidate_paths = find_paths_dfs(graph, start_coin, request.mode, max_depth=4, max_paths=limit)
+    candidate_paths = find_paths_dfs(graph, start_coin, request.mode, max_paths=limit)
 
     # Prefetch all symbols
     symbols_needed: Set[str] = set()
@@ -338,30 +333,33 @@ async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Que
                 orderbook_cache[sym] = best
         await asyncio.gather(*(fetch_sym(sym) for sym in symbols_needed))
 
-    # Streaming generator
     async def generator():
         yield '{"start_coin": "%s", "start_amount": %f, "mode": "%s", "opportunities": [' % (
             start_coin, request.start_amount, request.mode
         )
         first = True
+
+        # Use asyncio.as_completed to yield results immediately as they are done
         tasks = [simulate_path_profit_with_cache(graph, path, request.start_amount, orderbook_cache) for path in candidate_paths]
         for coro in asyncio.as_completed(tasks):
-            res = await coro
-            if res and res.profit_percent > 0:
-                if not first:
-                    yield ","
-                else:
-                    first = False
-                yield json.dumps(res.dict())
+            try:
+                res = await coro
+                if res and res.profit_percent > 0:
+                    if not first:
+                        yield ","
+                    else:
+                        first = False
+                    yield json.dumps(res.dict())
+            except Exception:
+                continue  # skip failed tasks
+
         yield '], "total_count": null, "fetch_timestamp": "%s"}' % fetch_timestamp
 
     response = StreamingResponse(generator(), media_type="application/json")
-    # Explicit CORS headers for streaming response
     response.headers["Access-Control-Allow-Origin"] = "https://arbitragecruo.netlify.app"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-
     return response
 
 # ----------------------------
