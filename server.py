@@ -1,70 +1,53 @@
 """
-FastAPI Backend - Bybit pairs + Binance orderbooks for REAL arbitrage detection
+FastAPI Backend using real Binance orderbooks for 3-step triangular arbitrage detection (streaming + async parallel)
 Run: uvicorn server:app --reload
 """
 
 import os
-import asyncio
 import httpx
-import json
+import asyncio
 from typing import Optional, Dict, List, Set, Tuple
 from enum import Enum
 from dataclasses import dataclass
 from collections import defaultdict
 from datetime import datetime
-import time
+import json
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-BYBIT_SPOT_API_URL = "https://api.bybit.com/v5/market/tickers"
-BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"
+# ----------------------------
+# Config
+# ----------------------------
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"  # ?symbol=SYMBOL&limit=5
+ORDERBOOK_LIMIT = 5
+TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))
+QUOTE_COINS = ["USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "SOL", "DOGE", "TRX", "XRP", "ADA"]
+ORDERBOOK_TTL_SECONDS = 10  # cache for 10s instead of 2s
 
-TRADING_FEE = float(os.getenv("TRADING_FEE", "0.001"))  # 0.1% per trade
-POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE", "ADA", "BUSD"}
-COIN_SUFFIXES = ["USDT", "USDC", "BUSD", "BTC", "ETH", "BNB", "SOL", "DOGE", "XRP", "TRX"]
-
-ORDERBOOK_TTL = 5  # Cache orderbook for 5 seconds
-MAX_ORDERBOOK_CALLS_PARALLEL = 10  # Limit concurrent orderbook requests
-
-# Global caches
-_orderbook_cache: Dict[str, Tuple[float, float, float]] = {}  # symbol -> (bid, ask, timestamp)
-_http_client: Optional[httpx.AsyncClient] = None
-_graph_cache: Optional['CoinGraph'] = None
-_graph_timestamp: Optional[str] = None
-_graph_cache_time: float = 0
-
-# ============================================================================
-# DATA MODELS
-# ============================================================================
-
+# ----------------------------
+# Models
+# ----------------------------
 class ArbitrageMode(str, Enum):
     START_ONLY = "START_ONLY"
     POPULAR_END = "POPULAR_END"
     BOTH = "BOTH"
 
-
 class RiskLevel(str, Enum):
     SAFE = "SAFE"
     MEDIUM = "MEDIUM"
-
 
 class ArbitrageRequest(BaseModel):
     start_coin: str = Field(..., min_length=1, max_length=20)
     start_amount: float = Field(..., gt=0)
     mode: ArbitrageMode
 
-    @validator('start_coin')
-    def validate_coin(cls, v):
+    @validator("start_coin")
+    def upper_coin(cls, v):
         return v.upper()
-
 
 class PathOpportunity(BaseModel):
     path: List[str]
@@ -75,7 +58,6 @@ class PathOpportunity(BaseModel):
     end_coin: str
     risk: RiskLevel
 
-
 class ArbitrageResponse(BaseModel):
     start_coin: str
     start_amount: float
@@ -84,16 +66,13 @@ class ArbitrageResponse(BaseModel):
     total_count: int
     fetch_timestamp: str
 
-
-# ============================================================================
-# COIN GRAPH
-# ============================================================================
-
+# ----------------------------
+# Graph structures
+# ----------------------------
 @dataclass
 class Edge:
     target: str
-    symbol: str
-
+    pair_symbol: str
 
 class CoinGraph:
     def __init__(self):
@@ -106,155 +85,102 @@ class CoinGraph:
         quote_u = quote.upper()
         if base_u == quote_u:
             return
-        
-        self.graph[base_u].append(Edge(target=quote_u, symbol=symbol))
-        self.graph[quote_u].append(Edge(target=base_u, symbol=symbol))
+        self.graph[base_u].append(Edge(target=quote_u, pair_symbol=symbol))
+        self.graph[quote_u].append(Edge(target=base_u, pair_symbol=symbol))
         self.all_coins.add(base_u)
         self.all_coins.add(quote_u)
-        
         self.symbol_map[(base_u, quote_u)] = symbol
         self.symbol_map[(quote_u, base_u)] = symbol
 
     def get_neighbors(self, coin: str) -> List[Edge]:
-        return self.graph.get(coin.upper(), [])[:15]  # Limit to top 15 neighbors
+        return self.graph.get(coin.upper(), [])
 
+# ----------------------------
+# Binance helpers
+# ----------------------------
+async def fetch_all_binance_symbols() -> Dict[str, float]:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(BINANCE_TICKER_URL)
+        r.raise_for_status()
+        data = r.json()
+    pairs: Dict[str, float] = {}
+    for entry in data:
+        sym = entry.get("symbol")
+        try:
+            price = float(entry.get("price", "0"))
+            if price > 0:
+                pairs[sym] = price
+        except Exception:
+            continue
+    return pairs
 
-# ============================================================================
-# HTTP CLIENT & BINANCE ORDERBOOK
-# ============================================================================
-
-async def get_http_client() -> httpx.AsyncClient:
-    """Persistent HTTP client with connection pooling."""
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            timeout=12.0,
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10)
-        )
-    return _http_client
-
+_orderbook_global_cache: Dict[str, Tuple[float, float, datetime]] = {}
 
 async def fetch_orderbook_best(symbol: str, client: httpx.AsyncClient) -> Optional[Tuple[float, float]]:
-    """
-    Fetch best bid/ask from Binance orderbook with TTL caching
-    Returns (best_bid, best_ask) or None if failed
-    """
-    now = time.time()
-    
-    # Check cache first
-    if symbol in _orderbook_cache:
-        bid, ask, ts = _orderbook_cache[symbol]
-        if now - ts < ORDERBOOK_TTL:
-            return bid, ask
-    
+    now = datetime.utcnow()
+    cached = _orderbook_global_cache.get(symbol)
+    if cached and (now - cached[2]).total_seconds() < ORDERBOOK_TTL_SECONDS:
+        return cached[0], cached[1]
+
+    params = {"symbol": symbol, "limit": ORDERBOOK_LIMIT}
     try:
-        params = {"symbol": symbol, "limit": 5}
-        r = await asyncio.wait_for(
-            client.get(BINANCE_ORDERBOOK_URL, params=params),
-            timeout=8.0
-        )
+        r = await client.get(BINANCE_ORDERBOOK_URL, params=params)
         r.raise_for_status()
         data = r.json()
     except Exception:
         return None
 
+    bids = data.get("bids", [])
+    asks = data.get("asks", [])
+    if not bids or not asks:
+        return None
     try:
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        if not bids or not asks:
-            return None
-        
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
-        
-        _orderbook_cache[symbol] = (best_bid, best_ask, now)
+        _orderbook_global_cache[symbol] = (best_bid, best_ask, now)
         return best_bid, best_ask
     except Exception:
         return None
 
-
-async def fetch_bybit_pairs() -> Dict[str, float]:
-    """Fetch Bybit spot pairs with pagination (used only for coin discovery)."""
-    try:
-        client = await get_http_client()
-        all_pairs = {}
-        cursor = ""
-        
-        while True:
-            params = {"category": "spot", "limit": 1000}
-            if cursor:
-                params["cursor"] = cursor
-            
-            r = await asyncio.wait_for(
-                client.get(BYBIT_SPOT_API_URL, params=params),
-                timeout=10.0
-            )
-            r.raise_for_status()
-            data = r.json()
-            
-            if data.get("retCode") != 0:
-                break
-            
-            tickers = data.get("result", {}).get("list", [])
-            if not tickers:
-                break
-            
-            for ticker in tickers:
-                try:
-                    symbol = ticker.get("symbol", "")
-                    # Convert Bybit format (BTCUSDT) to Binance format
-                    binance_symbol = symbol.replace("_", "")
-                    all_pairs[binance_symbol] = 1.0
-                except Exception:
-                    continue
-            
-            next_cursor = data.get("result", {}).get("nextPageCursor", "")
-            if not next_cursor:
-                break
-            cursor = next_cursor
-        
-        return all_pairs
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Bybit fetch failed: {str(e)}")
-
-
-def extract_coins(symbol: str) -> Tuple[Optional[str], Optional[str]]:
-    """Extract base/quote from symbol."""
-    symbol_u = symbol.upper()
-    for suffix in COIN_SUFFIXES:
-        if symbol_u.endswith(suffix) and len(symbol_u) > len(suffix):
-            return symbol_u[:-len(suffix)], suffix
-    return None, None
-
-
-def build_graph(symbols: Dict[str, float]) -> CoinGraph:
-    """Build coin graph from symbols."""
+# ----------------------------
+# Build graph from symbols
+# ----------------------------
+def build_graph_from_symbols(symbols: Dict[str, float]) -> CoinGraph:
     graph = CoinGraph()
     for sym in symbols.keys():
-        base, quote = extract_coins(sym)
-        if base and quote and base != quote:
-            graph.add_pair(base, quote, sym)
+        sym_u = sym.upper()
+        for q in QUOTE_COINS:
+            if sym_u.endswith(q) and len(sym_u) > len(q):
+                base = sym_u[: len(sym_u) - len(q)]
+                quote = q
+                if base and base != quote:
+                    graph.add_pair(base, quote, sym_u)
+                break
     return graph
 
+# ----------------------------
+# DFS paths (3-step triangles only)
+# ----------------------------
+POPULAR_COINS = {"USDT", "USDC", "BTC", "ETH", "BNB", "SOL", "XRP", "TRX", "DOGE"}
 
-# ============================================================================
-# DFS - HEAVILY OPTIMIZED
-# ============================================================================
+def get_risk_level(coin: str) -> RiskLevel:
+    return RiskLevel.SAFE if coin.upper() in POPULAR_COINS else RiskLevel.MEDIUM
 
-POPULAR_COINS_SET = POPULAR_COINS
-
-def get_risk(coin: str) -> RiskLevel:
-    return RiskLevel.SAFE if coin.upper() in POPULAR_COINS_SET else RiskLevel.MEDIUM
-
-
-def find_paths(graph: CoinGraph, start: str, mode: ArbitrageMode, max_paths: int = 200) -> List[List[str]]:
-    """Aggressive path pruning - max 200 paths, depth 3 only"""
-    start = start.upper()
+def find_paths_dfs(
+    graph: CoinGraph,
+    start_coin: str,
+    mode: ArbitrageMode,
+    max_paths: int = 300  # reduced from 500
+) -> List[List[str]]:
+    start = start_coin.upper()
     paths: List[List[str]] = []
     seen = set()
+    
+    # Prioritize popular coins first for faster path finding
+    def sort_neighbors(edges: List[Edge]) -> List[Edge]:
+        return sorted(edges, key=lambda e: 0 if e.target in POPULAR_COINS else 1)
 
-    def dfs(curr: str, path: List[str]):
+    def dfs(current: str, path: List[str]):
         if len(paths) >= max_paths:
             return
         if len(path) == 3:
@@ -263,228 +189,198 @@ def find_paths(graph: CoinGraph, start: str, mode: ArbitrageMode, max_paths: int
             if mode == ArbitrageMode.START_ONLY:
                 ok = end == start
             elif mode == ArbitrageMode.POPULAR_END:
-                ok = end in POPULAR_COINS_SET
+                ok = end.upper() in POPULAR_COINS
             else:
                 ok = True
-            if ok and tuple(path) not in seen:
-                seen.add(tuple(path))
-                paths.append(path[:])
+            if ok:
+                t = tuple(path)
+                if t not in seen:
+                    seen.add(t)
+                    paths.append(path.copy())
             return
         
-        for edge in graph.get_neighbors(curr):
+        neighbors = sort_neighbors(graph.get_neighbors(current))
+        for edge in neighbors[:15]:
             if len(path) <= 1 or edge.target != path[-2]:
-                dfs(edge.target, path + [edge.target])
+                path.append(edge.target)
+                dfs(edge.target, path)
+                path.pop()
 
     dfs(start, [start])
     return paths
 
-
-# ============================================================================
-# PROFIT CALCULATION WITH ORDERBOOKS
-# ============================================================================
-
-async def calc_profit_with_ob(
+# ----------------------------
+# Async path profit simulation - OPTIMIZED
+# ----------------------------
+def simulate_path_profit_sync(
     graph: CoinGraph,
     path: List[str],
-    start_amt: float,
-    ob_cache: Dict[str, Tuple[float, float]]
+    start_amount: float,
+    orderbook_cache: Dict[str, Tuple[float, float]]
 ) -> Optional[PathOpportunity]:
-    """
-    Calculate profit using Binance orderbook prices (bid/ask)
-    Returns opportunity or None if invalid
-    """
-    amt = start_amt
-    pairs_used = []
+    amount = start_amount
+    pairs_used: List[str] = []
 
     for i in range(len(path) - 1):
-        src = path[i].upper()
-        tgt = path[i + 1].upper()
-        
-        symbol = graph.symbol_map.get((src, tgt))
+        source = path[i].upper()
+        target = path[i + 1].upper()
+        symbol = graph.symbol_map.get((source, target))
         if not symbol:
             return None
+
+        if symbol not in orderbook_cache:
+            return None
         
-        # Get bid/ask from cache or fetch
-        if symbol in ob_cache:
-            best_bid, best_ask = ob_cache[symbol]
-        else:
-            client = await get_http_client()
-            result = await fetch_orderbook_best(symbol, client)
-            if not result:
-                return None
-            best_bid, best_ask = result
-            ob_cache[symbol] = best_bid, best_ask
-        
-        # Parse symbol to determine direction
-        base, quote = extract_coins(symbol)
+        best_bid, best_ask = orderbook_cache[symbol]
+
+        base, quote = None, None
+        for q in QUOTE_COINS:
+            if symbol.upper().endswith(q) and len(symbol) > len(q):
+                base = symbol[: len(symbol) - len(q)]
+                quote = q
+                break
         if not base or not quote:
             return None
-        
-        # Determine direction and apply bid/ask accordingly
-        if src == quote and tgt == base:
-            # Selling quote, buying base -> use best_ask
-            amt = (amt / best_ask) * (1 - TRADING_FEE)
-        elif src == base and tgt == quote:
-            # Selling base, buying quote -> use best_bid
-            amt = (amt * best_bid) * (1 - TRADING_FEE)
+
+        if source == quote and target == base:
+            amount = (amount / best_ask) * (1 - TRADING_FEE)
+        elif source == base and target == quote:
+            amount = (amount * best_bid) * (1 - TRADING_FEE)
         else:
             return None
-        
+
         pairs_used.append(symbol)
-        
-        if amt < 0.0001:
-            return None
-    
-    profit_pct = ((amt - start_amt) / start_amt) * 100
-    if profit_pct <= 0:
-        return None
-    
+
+    profit_percent = ((amount - start_amount) / start_amount) * 100
     return PathOpportunity(
         path=path,
         pairs=pairs_used,
-        start_amount=start_amt,
-        end_amount=round(amt, 12),
-        profit_percent=round(profit_pct, 8),
+        start_amount=start_amount,
+        end_amount=round(amount, 12),
+        profit_percent=round(profit_percent, 8),
         end_coin=path[-1],
-        risk=get_risk(path[-1])
+        risk=get_risk_level(path[-1])
     )
 
-
-# ============================================================================
-# FASTAPI
-# ============================================================================
-
-app = FastAPI(title="Arbitrage Backend", version="2.0.0")
+# ----------------------------
+# FastAPI app
+# ----------------------------
+app = FastAPI(title="Binance 3-Step Arbitrage", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://scrapper-h4xe.onrender.com",
+        "https://arbitragecruo.netlify.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+_graph_cache: Optional[CoinGraph] = None
+_graph_timestamp: Optional[str] = None
+_last_symbol_snapshot: Optional[Dict[str, float]] = None
 
 async def get_or_refresh_graph(force: bool = False) -> Tuple[CoinGraph, str]:
-    """Get cached graph or refresh (5 min TTL)."""
-    global _graph_cache, _graph_timestamp, _graph_cache_time
-    now = time.time()
-    
-    if force or _graph_cache is None or (now - _graph_cache_time) > 300:
-        pairs = await fetch_bybit_pairs()
-        _graph_cache = build_graph(pairs)
+    global _graph_cache, _graph_timestamp, _last_symbol_snapshot
+    if _graph_cache is None or force or _last_symbol_snapshot is None:
+        symbols = await fetch_all_binance_symbols()
+        _last_symbol_snapshot = symbols
+        _graph_cache = build_graph_from_symbols(symbols)
         _graph_timestamp = datetime.utcnow().isoformat()
-        _graph_cache_time = now
-    
     return _graph_cache, _graph_timestamp
 
-
-@app.on_event("startup")
-async def startup():
-    """Warm cache on startup."""
-    await get_or_refresh_graph(force=True)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Close client."""
-    global _http_client
-    if _http_client:
-        await _http_client.aclose()
-
-
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
-
+async def health_check():
+    return {"status": "healthy", "service": "binance-arb-backend"}
 
 @app.get("/graph/info")
 async def graph_info():
-    graph, ts = await get_or_refresh_graph()
-    return {"coins": len(graph.all_coins), "timestamp": ts}
-
-
-@app.post("/arbitrage/calculate", response_model=ArbitrageResponse)
-async def calculate(request: ArbitrageRequest):
-    """Fast calculation with orderbook prices (target: <3 seconds)"""
-    try:
-        start = time.time()
-        graph, ts = await get_or_refresh_graph()
-        
-        start_coin = request.start_coin.upper()
-        if start_coin not in graph.all_coins:
-            raise HTTPException(400, f"Coin {start_coin} not found")
-        
-        # Find paths
-        paths = find_paths(graph, start_coin, request.mode, max_paths=200)
-        
-        # Prefetch all orderbooks in parallel
-        symbols_needed = set()
-        for path in paths:
-            for i in range(len(path) - 1):
-                sym = graph.symbol_map.get((path[i].upper(), path[i + 1].upper()))
-                if sym:
-                    symbols_needed.add(sym)
-        
-        ob_cache: Dict[str, Tuple[float, float]] = {}
-        client = await get_http_client()
-        
-        # Batch fetch with semaphore for parallelism
-        sem = asyncio.Semaphore(MAX_ORDERBOOK_CALLS_PARALLEL)
-        async def fetch_with_sem(sym):
-            async with sem:
-                result = await fetch_orderbook_best(sym, client)
-                if result:
-                    ob_cache[sym] = result
-        
-        await asyncio.gather(*[fetch_with_sem(sym) for sym in symbols_needed], return_exceptions=True)
-        
-        # Calculate profits
-        opportunities = []
-        tasks = [calc_profit_with_ob(graph, path, request.start_amount, ob_cache) for path in paths]
-        
-        for coro in asyncio.as_completed(tasks):
-            try:
-                opp = await coro
-                if opp:
-                    opportunities.append(opp)
-            except Exception:
-                continue
-        
-        # Sort and limit
-        opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
-        
-        elapsed = time.time() - start
-        print(f"[v0] Calculation took {elapsed:.2f}s for {len(paths)} paths, found {len(opportunities)} opportunities")
-        
-        return ArbitrageResponse(
-            start_coin=start_coin,
-            start_amount=request.start_amount,
-            mode=request.mode,
-            opportunities=opportunities[:50],
-            total_count=len(opportunities),
-            fetch_timestamp=ts
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
+    graph, timestamp = await get_or_refresh_graph()
+    return {
+        "coins_count": len(graph.all_coins),
+        "pairs_count": sum(len(edges) for edges in graph.graph.values()),
+        "fetch_timestamp": timestamp,
+    }
 
 @app.post("/arbitrage/refresh")
-async def refresh():
-    """Refresh graph."""
-    try:
-        pairs = await fetch_bybit_pairs()
-        global _graph_cache, _graph_timestamp, _graph_cache_time
-        _graph_cache = build_graph(pairs)
-        _graph_timestamp = datetime.utcnow().isoformat()
-        _graph_cache_time = time.time()
-        return {"status": "ok", "timestamp": _graph_timestamp}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+async def refresh_graph():
+    graph, timestamp = await get_or_refresh_graph(force=True)
+    return {"status": "success", "fetch_timestamp": timestamp, "coins_count": len(graph.all_coins)}
 
+@app.post("/arbitrage/calculate/stream")
+async def calculate_arbitrage_stream(request: ArbitrageRequest, limit: int = Query(300, ge=1, le=1000)):
+    graph, fetch_timestamp = await get_or_refresh_graph()
+    start_coin = request.start_coin.upper()
+    if start_coin not in graph.all_coins:
+        raise HTTPException(status_code=400, detail=f"Start coin '{start_coin}' not available in Binance pairs")
 
+    candidate_paths = find_paths_dfs(graph, start_coin, request.mode, max_paths=min(limit, 300))
+
+    # Prefetch all symbols with aggressive timeout
+    symbols_needed: Set[str] = set()
+    for path in candidate_paths:
+        for i in range(len(path) - 1):
+            s, t = path[i].upper(), path[i + 1].upper()
+            sym = graph.symbol_map.get((s, t))
+            if sym:
+                symbols_needed.add(sym)
+
+    orderbook_cache: Dict[str, Tuple[float, float]] = {}
+    semaphore = asyncio.Semaphore(50)  # Limit concurrent requests
+    
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        async def fetch_sym(sym):
+            async with semaphore:
+                try:
+                    best = await fetch_orderbook_best(sym, client)
+                    if best:
+                        orderbook_cache[sym] = best
+                except Exception:
+                    pass  # Skip failed fetches
+        
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(fetch_sym(sym) for sym in symbols_needed), return_exceptions=True),
+                timeout=5.0  # Max 5 seconds for all orderbook fetches
+            )
+        except asyncio.TimeoutError:
+            pass  # Continue with whatever we fetched
+
+    async def generator():
+        opportunities = []
+        
+        for path in candidate_paths:
+            res = simulate_path_profit_sync(graph, path, request.start_amount, orderbook_cache)
+            if res and res.profit_percent > 0:
+                opportunities.append(res)
+        
+        opportunities.sort(key=lambda x: x.profit_percent, reverse=True)
+        opportunities = opportunities[:50]
+        
+        # Stream results
+        yield '{"start_coin": "%s", "start_amount": %f, "mode": "%s", "opportunities": [' % (
+            start_coin, request.start_amount, request.mode
+        )
+        
+        for idx, opp in enumerate(opportunities):
+            if idx > 0:
+                yield ","
+            yield json.dumps(opp.dict())
+        
+        yield '], "total_count": %d, "fetch_timestamp": "%s"}' % (len(opportunities), fetch_timestamp)
+
+    response = StreamingResponse(generator(), media_type="application/json")
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+# ----------------------------
+# Run
+# ----------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
     
